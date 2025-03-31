@@ -21,21 +21,33 @@ jobs:
         type: executor
     executor: << parameters.os >>
     #resource_class: xlarge
+    environment:
+      KUMOD_TESTCONTAINERS: 0
+      #REF_TYPE: ${{ github.ref_type }}
+      CARGO_INCREMENTAL: 0
+      ROCKSDB_LIB_DIR: /opt/kumomta/lib
+      ROCKSDB_STATIC: static
+      SNAPPY_LIB_DIR: /opt/kumomta/lib
+      SNAPPY_STATIC: static
+      HOME: /root
     steps:
       - checkout
       - restore_cache:
           key: cargo-{{ checksum "Cargo.lock" }}
-      - run: uname -a
-      - run:
-          env:
-            KUMOD_TESTCONTAINERS: 0
-            #REF_TYPE: ${{ github.ref_type }}
-            CARGO_INCREMENTAL: 0
-            ROCKSDB_LIB_DIR: /opt/kumomta/lib
-            ROCKSDB_STATIC: static
-            SNAPPY_LIB_DIR: /opt/kumomta/lib
-            SNAPPY_STATIC: static
-          command: HOME=/root PATH=$PATH:/root/.cargo/bin echo make test
+      - test:
+          name: Run Tests
+          command: PATH=$PATH:/root/.cargo/bin make test
+      - build:
+          name: Build Release Package
+          command: |
+            PATH=$PATH:/root/.cargo/bin make BUILD_OPTS="--release"
+            ./assets/build-deb.sh
+      - verify-installable:
+          name: Verify That Package is Installable
+          command: |
+            apt update
+            apt-get install -y ./kumomta*.deb
+
       - save_cache:
           key: cargo-{{ checksum "Cargo.lock" }}
           paths:
