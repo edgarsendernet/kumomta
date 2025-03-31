@@ -34,15 +34,15 @@ jobs:
       - checkout
       - restore_cache:
           key: cargo-{{ checksum "Cargo.lock" }}
-      - test:
+      - run:
           name: Run Tests
           command: PATH=$PATH:/root/.cargo/bin make test
-      - build:
+      - run:
           name: Build Release Package
           command: |
             PATH=$PATH:/root/.cargo/bin make BUILD_OPTS="--release"
             ./assets/build-deb.sh
-      - verify-installable:
+      - run:
           name: Verify That Package is Installable
           command: |
             apt update
