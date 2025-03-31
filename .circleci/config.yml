@@ -19,7 +19,7 @@ jobs:
     parameters:
       os:
         type: executor
-    executor: << parameters.machine-type >>
+    executor: << parameters.os >>
     #resource_class: xlarge
     steps:
       - checkout
