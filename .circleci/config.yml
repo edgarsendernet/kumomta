@@ -33,7 +33,7 @@ jobs:
     steps:
       - checkout
       - restore_cache:
-          key: cargo-{{ checksum "Cargo.lock" }}
+          key: cargo-{{ arch }}-{{ checksum "Cargo.lock" }}
       - run:
           name: Run Tests
           command: PATH=$PATH:/root/.cargo/bin make test
@@ -49,7 +49,7 @@ jobs:
             apt-get install -y ./kumomta*.deb
 
       - save_cache:
-          key: cargo-{{ checksum "Cargo.lock" }}
+          key: cargo-{{ arch }}-{{ checksum "Cargo.lock" }}
           paths:
             - ~/.cargo
   deploy:
