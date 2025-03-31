@@ -3,7 +3,7 @@ jobs:
   test-rust:
     docker:
       - image: ghcr.io/kumocorp/builder-for-ubuntu:22.04
-    resource_class: large
+    resource_class: 2xlarge
     steps:
       - checkout
       - restore_cache:
