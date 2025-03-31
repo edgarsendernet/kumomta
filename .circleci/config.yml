@@ -51,8 +51,8 @@ jobs:
 workflows:
   build-and-test:
     jobs:
-      - test-rust
-    matrix:
-      parameters:
-        os: [ubuntu_2004_amd64, ubuntu_2204_amd64]
+      - test-rust:
+          matrix:
+            parameters:
+              os: [ubuntu_2004_amd64, ubuntu_2204_amd64]
 
