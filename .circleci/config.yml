@@ -3,6 +3,7 @@ jobs:
   test-rust:
     docker:
       - image: ghcr.io/kumocorp/builder-for-ubuntu:22.04
+    resource_class: xlarge
     steps:
       - checkout
       - restore_cache:
@@ -11,6 +12,7 @@ jobs:
           env:
             KUMOD_TESTCONTAINERS: 0
             #REF_TYPE: ${{ github.ref_type }}
+            CARGO_INCREMENTAL: 0
             ROCKSDB_LIB_DIR: /opt/kumomta/lib
             ROCKSDB_STATIC: static
             SNAPPY_LIB_DIR: /opt/kumomta/lib
