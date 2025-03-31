@@ -1,8 +1,22 @@
 version: 2.1
-jobs:
-  test-rust:
+
+executors:
+  ubuntu_2004_amd64:
+    docker:
+      - image: ghcr.io/kumocorp/builder-for-ubuntu:20.04
+  ubuntu_2204_amd64:
     docker:
       - image: ghcr.io/kumocorp/builder-for-ubuntu:22.04
+  #ubuntu_2204_aarch64:
+  #  docker:
+  #    - image: ghcr.io/kumocorp/builder-for-aarch64-ubuntu:22.04
+
+jobs:
+  test-rust:
+    parameters:
+      os:
+        type: executor
+    executor: << parameters.os >>
     resource_class: xlarge
     steps:
       - checkout
@@ -17,7 +31,7 @@ jobs:
             ROCKSDB_STATIC: static
             SNAPPY_LIB_DIR: /opt/kumomta/lib
             SNAPPY_STATIC: static
-          command: HOME=/root PATH=$PATH:/root/.cargo/bin make test
+          command: HOME=/root PATH=$PATH:/root/.cargo/bin echo make test
       - save_cache:
           key: cargo-{{ checksum "Cargo.lock" }}
           paths:
@@ -38,3 +52,7 @@ workflows:
   build-and-test:
     jobs:
       - test-rust
+    matrix:
+      parameters:
+        os: [ubuntu_2004_amd64, ubuntu_2204_amd64]
+
