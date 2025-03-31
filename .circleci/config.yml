@@ -40,7 +40,7 @@ jobs:
       - run:
           name: Build Release Package
           command: |
-            PATH=$PATH:/root/.cargo/bin make BUILD_OPTS="--release"
+            PATH=$PATH:/root/.cargo/bin make build BUILD_OPTS="--release"
             ./assets/build-deb.sh
       - run:
           name: Verify That Package is Installable
