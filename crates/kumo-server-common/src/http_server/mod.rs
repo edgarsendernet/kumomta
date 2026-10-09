@@ -1,6 +1,7 @@
 use crate::diagnostic_logging::set_diagnostic_log_filter;
+use crate::start::{MACHINE_INFO, ONLINE_SINCE};
 use anyhow::Context;
-use axum::extract::{DefaultBodyLimit, Json, Query};
+use axum::extract::{DefaultBodyLimit, Json, Query, State};
 use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -182,9 +183,11 @@ impl RouterAndDocs {
         add_handlers!(
             bump_config_epoch,
             memory_stats,
+            task_dump,
             report_metrics,
             report_metrics_json,
             set_diagnostic_log_filter_v1,
+            machine_info,
         );
     }
 }
@@ -251,6 +254,7 @@ macro_rules! router_with_docs {
 
 #[derive(Clone)]
 pub struct AppState {
+    process_kind: String,
     params: HttpListenerParams,
     local_addr: SocketAddr,
 }
@@ -307,8 +311,9 @@ impl HttpListenerParams {
         let addr = socket.local_addr()?;
 
         let app_state = AppState {
+            process_kind: router_and_docs.docs.info.title.clone(),
             params: self.clone(),
-            local_addr: addr.clone(),
+            local_addr: addr,
         };
 
         let app = router_and_docs
@@ -411,6 +416,41 @@ where
     }
 }
 
+/// Returns information identifying this instance
+#[utoipa::path(get, tag = "debugging", path = "/api/machine-info",
+    responses(
+        (status=200, description="Machine information", body=MachineInfoV1)
+    ),
+)]
+async fn machine_info(State(state): State<AppState>) -> Result<Json<MachineInfoV1>, AppError> {
+    let online_since = *ONLINE_SINCE;
+    match MACHINE_INFO.lock().as_ref() {
+        Some(info) => Ok(Json(MachineInfoV1 {
+            hostname: info.hostname.clone(),
+            mac_address: info.mac_address.clone(),
+            node_id: info.node_id.clone().unwrap_or_else(String::new),
+            num_cores: info.num_cores,
+            kernel_version: info.kernel_version.clone(),
+            platform: info.platform.clone(),
+            distribution: info.distribution.clone(),
+            os_version: info.os_version.clone(),
+            total_memory_bytes: info.total_memory_bytes,
+            container_runtime: info.container_runtime.clone(),
+            cpu_brand: info.cpu_brand.clone(),
+            fingerprint: info.fingerprint(),
+            online_since,
+            process_kind: state.process_kind.clone(),
+            version: version_info::kumo_version().to_string(),
+        })),
+        None => {
+            return Err(AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "machine info not yet available",
+            ));
+        }
+    }
+}
+
 /// Allows the system operator to trigger a configuration epoch bump,
 /// which causes various configs that are using the Epoch strategy to
 /// be re-evaluated by triggering the appropriate callbacks.
@@ -425,6 +465,41 @@ where
 async fn bump_config_epoch() -> Result<(), AppError> {
     config::epoch::bump_current_epoch();
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct TaskDumpParams {
+    #[serde(default)]
+    timeout: Option<u64>,
+}
+
+/// Returns a dump of the runtime task state.
+///
+/// {{since('2026.04.09-ea3b2a9b')}}
+///
+/// The output is not machine parseable and may change without notice
+/// between versions of kumomta.
+///
+/// Capturing the dump is very expensive and can take several seconds.
+/// Capturing a dump is not guaranteed to succeed.
+///
+/// At the time of writing, capturing a dump can cause a subsequent
+/// graceful shutdown to get stuck, unless you repeatedly trigger
+/// this API endpoint a few more times to "clock through" the shutdown
+/// process and enable it to complete successfully.
+#[utoipa::path(
+    get,
+    tag="debugging",
+    path="/api/admin/task-dump",
+    responses(
+        (status=200, description="data was returned")
+    ),
+)]
+async fn task_dump(Query(params): Query<TaskDumpParams>) -> String {
+    kumo_server_runtime::dump_all_runtimes(tokio::time::Duration::from_secs(
+        params.timeout.unwrap_or(5),
+    ))
+    .await
 }
 
 /// Returns information about the system memory usage in an unstructured

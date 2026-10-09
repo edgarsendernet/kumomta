@@ -57,11 +57,11 @@ impl<'env, 'source> Template<'env, 'source> {
     ) -> anyhow::Result<()> {
         match &self {
             Self::Jinja(t) => {
-                t.render_to_write(ctx, w)?;
+                t.render_captured_to(ctx, w)?;
                 Ok(())
             }
             Self::Static(s) => {
-                w.write(s.as_bytes())?;
+                w.write_all(s.as_bytes())?;
                 Ok(())
             }
             Self::Handlebars { engine, template } => {

@@ -4,26 +4,29 @@ use crate::http_server::admin_trace_smtp_client_v1::{
 };
 use crate::logging::disposition::{log_disposition, LogDisposition, RecordType};
 use crate::queue::{IncrementAttempts, InsertReason, QueueManager, QueueState};
-use crate::ready_queue::{Dispatcher, QueueDispatcher};
-use crate::smtp_server::ShuttingDownError;
+use crate::ready_queue::{AttemptConnectionDisposition, Dispatcher, QueueDispatcher};
 use crate::spool::SpoolManager;
 use anyhow::Context;
 use async_trait::async_trait;
 use bounce_classify::{BounceClass, PreDefinedBounceClass};
 use config::{load_config, CallbackSignature};
 use data_loader::KeySource;
-use dns_resolver::{has_colon_port, resolve_a_or_aaaa, ResolvedMxAddresses};
+use dns_resolver::{
+    has_colon_port, resolve_a_or_aaaa, DaneStatus, IpLookupStrategy, SecureCnameStatus,
+};
 use kumo_address::socket::SocketAddress;
 use kumo_api_types::egress_path::{EgressPathConfig, ReconnectStrategy, Tls};
 use kumo_log_types::{MaybeProxiedSourceAddress, ResolvedAddress};
-use kumo_server_lifecycle::ShutdownSubcription;
+use kumo_prometheus::declare_metric;
+use kumo_server_lifecycle::{ShutdownSubcription, ShuttingDownError};
 use kumo_server_runtime::spawn;
+use mailexchanger::{PolicyMode, ResolvedMxAddresses};
 use message::message::QueueNameComponents;
 use message::Message;
-use mta_sts::policy::PolicyMode;
+use rfc5321::parser::{EnvelopeAddress, ForwardPath, ReversePath};
 use rfc5321::{
-    ClientError, EnhancedStatusCode, ForwardPath, IsTooManyRecipients, Response, ReversePath,
-    SmtpClient, TlsInformation, TlsOptions, TlsStatus,
+    ClientError, EnhancedStatusCode, IsTooManyRecipients, Response, SmtpClient, TlsInformation,
+    TlsOptions, TlsStatus,
 };
 use serde::{Deserialize, Serialize};
 use spool::SpoolId;
@@ -43,13 +46,83 @@ lruttl::declare_cache! {
 static CLIENT_CERT: LruCacheWithTtl<KeySource, Result<Option<Arc<Box<[u8]>>>, String>>::new("smtp_dispatcher_client_certificate", 1024);
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+declare_metric! {
+/// Number of DANE policy decisions made on the SMTP delivery path, labelled by
+/// `result`.
+///
+/// {{since('2026.09.22-a276d4a8')}}
+///
+/// The `result` label is one of:
+///
+///   * `ok`: usable DANE-TA(2)/DANE-EE(3) TLSA records were found; the peer
+///     certificate is checked against them.
+///   * `unusable`: TLSA records were published but none are usable; STARTTLS is
+///     required but the peer certificate is not checked.
+///   * `not_applicable`: the chain to the MX host was DNSSEC-validated but there
+///     are no TLSA records (securely absent), so DANE does not apply.
+///   * `insecure_chain`: DANE is enabled but the chain to the MX host was not
+///     DNSSEC-validated, so DANE does not apply. A persistently high value here
+///     with none of the other results can indicate that the resolver is not
+///     performing DNSSEC validation.
+///   * `tempfail`: the TLSA lookup could not be securely resolved (SERVFAIL,
+///     timeout, or bogus); delivery is deferred.
+///
+/// These are counters; reason about them as rates.
+///
+/// **Confirming DANE is working:** with `enable_dane = true`, a healthy
+/// deployment shows a steady stream of `not_applicable` (most DNSSEC-signed
+/// domains do not publish TLSA records) plus some `ok` for the destinations
+/// that do. The single most useful health check is: if you only ever see
+/// `insecure_chain` and never `ok` or `not_applicable`, your
+/// resolver is almost certainly not performing DNSSEC validation, so DANE is
+/// silently doing nothing — verify that you configured a validating resolver.
+/// For an ad-hoc check that does not require standing up a sink or large-scale
+/// test, <https://havedane.net> publishes known-good TLSA records: send a test
+/// message to an address there and confirm that `ok` increments.
+///
+/// **What to alert on:**
+///
+///   * A sustained or rising rate of `tempfail` is the highest-signal problem:
+///     each one is a *deferred delivery* because the TLSA lookup could not be
+///     securely resolved. This usually points at resolver or upstream-DNS
+///     trouble (SERVFAIL, timeouts, bogus answers), and only rarely at an
+///     active downgrade attempt; either way, mail is being delayed, so it is
+///     worth paging on.
+///   * `ok` pinned at zero while `insecure_chain` is high (with
+///     `enable_dane = true`) indicates a non-validating resolver, i.e. DANE is
+///     not engaging at all.
+///   * `unusable` is informational: a remote operator published TLSA records
+///     that are not usable for SMTP DANE (for example, only PKIX usages). A low
+///     background level is normal and reflects the remote side, not your
+///     infrastructure.
+///   * `not_applicable` and `insecure_chain` are expected in normal operation
+///     for the large fraction of destinations that do not publish usable TLSA
+///     records or are not DNSSEC-signed; do not alert on these in isolation.
+static DANE_RESULT: IntCounterVec(
+        "dane_result_count",
+        &["result"]);
+}
+
+fn record_dane_result(result: &str) {
+    if let Ok(counter) = DANE_RESULT.get_metric_with_label_values(&[result]) {
+        counter.inc();
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq)]
 pub struct SmtpProtocol {
     #[serde(default)]
     pub mx_list: Vec<MxListEntry>,
+
+    /// Treat the hosts in `mx_list` as a trusted (DNSSEC-secure) MX selection
+    /// for the purposes of DANE downgrade resistance. Leave this false (the
+    /// default) when `mx_list` is derived from an untracked DNS lookup;
+    /// otherwise a spoofed lookup could let an attacker-chosen host pass DANE.
+    #[serde(default)]
+    pub treat_mx_list_as_secure: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum MxListEntry {
     /// A name that needs to be resolved to its A or AAAA record in DNS,
@@ -61,16 +134,23 @@ pub enum MxListEntry {
 }
 
 impl MxListEntry {
-    /// Resolve self into 1 or more `ResolvedAddress` and append to the
-    /// supplied `addresses` vector.
-    pub async fn resolve_into(&self, addresses: &mut Vec<ResolvedAddress>) -> anyhow::Result<()> {
+    /// Resolve self into 1 or more `ResolvedAddress` and append to the supplied
+    /// `addresses` vector. At most `max_addresses_per_host` addresses are
+    /// appended for a name that resolves to an `A`/`AAAA` RRset, bounding the
+    /// contribution of one entry.
+    pub async fn resolve_into(
+        &self,
+        addresses: &mut Vec<ResolvedAddress>,
+        strategy: IpLookupStrategy,
+        max_addresses_per_host: usize,
+    ) -> anyhow::Result<()> {
         match self {
             Self::Name(a) => {
                 if let Some((label, port)) = has_colon_port(a) {
-                    let resolved = resolve_a_or_aaaa(label, None)
+                    let resolved = resolve_a_or_aaaa(label, None, strategy)
                         .await
                         .with_context(|| format!("resolving mx_list entry {a}"))?;
-                    for mut r in resolved {
+                    for mut r in resolved.into_iter().take(max_addresses_per_host) {
                         r.addr.set_port(port);
                         addresses.push(r);
                     }
@@ -78,11 +158,11 @@ impl MxListEntry {
                     return Ok(());
                 }
 
-                addresses.append(
-                    &mut resolve_a_or_aaaa(a, None)
-                        .await
-                        .with_context(|| format!("resolving mx_list entry {a}"))?,
-                );
+                let mut resolved = resolve_a_or_aaaa(a, None, strategy)
+                    .await
+                    .with_context(|| format!("resolving mx_list entry {a}"))?;
+                resolved.truncate(max_addresses_per_host);
+                addresses.append(&mut resolved);
             }
             Self::Resolved(addr) => {
                 addresses.push(addr.clone());
@@ -115,6 +195,7 @@ pub struct SmtpDispatcher {
     site_has_broken_tls: bool,
     terminated_ok: bool,
     attempted_message_send: bool,
+    treat_mx_list_as_secure: bool,
     recips_last_txn: HashMap<(SpoolId, ForwardPath), u8>,
 }
 
@@ -125,20 +206,6 @@ pub struct OpportunisticInsecureTlsHandshakeError {
     pub error: ClientError,
     pub address: String,
     pub label: String,
-}
-
-impl OpportunisticInsecureTlsHandshakeError {
-    pub fn is_match_anyhow(err: &anyhow::Error) -> bool {
-        Self::is_match(err.root_cause())
-    }
-
-    pub fn is_match(err: &(dyn std::error::Error + 'static)) -> bool {
-        if let Some(cause) = err.source() {
-            return Self::is_match(cause);
-        } else {
-            err.downcast_ref::<Self>().is_some()
-        }
-    }
 }
 
 impl SmtpDispatcher {
@@ -163,13 +230,26 @@ impl SmtpDispatcher {
                 .mx
                 .as_ref()
                 .expect("to have mx when doing smtp")
-                .resolve_addresses()
+                .resolve_addresses(
+                    None,
+                    path_config.ip_lookup_strategy,
+                    path_config.max_mx_plan_size,
+                    path_config.max_mx_addresses_per_host,
+                )
                 .await
         } else {
             let mut addresses = vec![];
             for a in proto_config.mx_list.iter() {
-                a.resolve_into(&mut addresses).await?;
+                a.resolve_into(
+                    &mut addresses,
+                    path_config.ip_lookup_strategy,
+                    path_config.max_mx_addresses_per_host,
+                )
+                .await?;
             }
+            // The list is still in most-preferred-first order here. `truncate`
+            // drops entries off the least-preferred end.
+            addresses.truncate(path_config.max_mx_plan_size);
             // Note that ResolvedMxAddresses::Addresses is in LIFO
             // order, and we have FIFO order.  Reverse it!
             addresses.reverse();
@@ -290,14 +370,91 @@ impl SmtpDispatcher {
             site_has_broken_tls: false,
             terminated_ok: false,
             attempted_message_send: false,
+            treat_mx_list_as_secure: proto_config.treat_mx_list_as_secure,
             recips_last_txn: HashMap::new(),
         }))
     }
 
-    async fn attempt_connection_impl(&mut self, dispatcher: &mut Dispatcher) -> anyhow::Result<()> {
-        if let Some(client) = &self.client {
+    async fn attempt_connection_impl(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+    ) -> anyhow::Result<AttemptConnectionDisposition> {
+        if let Some(client) = &mut self.client {
             if client.is_connected() {
-                return Ok(());
+                // If we get a unilateral response here now it can either be:
+                // 1. a 421 advising us that the connection is being closed.
+                // 2. a protocol sync/deviation/conformance issue, and we must
+                //    therefore treat this as a closed connection.
+                // Errors that present here also indicate that the connection
+                // has closed.
+                //
+                // We want to surface these right now so that we can proceed with
+                // making a new connection, rather than returning this current
+                // connection that will immediately result in a transfail
+                // when we try sending a message through it.
+                match client.check_unilateral_response().await {
+                    Ok(None) => {
+                        // Still connected
+                        return Ok(AttemptConnectionDisposition::ReusedExisting);
+                    }
+                    Ok(Some(response)) => {
+                        // We got an explicit signal that the connection is closing
+                        // out.  We don't consider this to be a transport error
+                        // so we'll close the current connection.
+                        // If we've managed to send messages so far in this session,
+                        // then we're consider it to be a successful plan so we should
+                        // not advance to the next candidate in the plan and make a
+                        // new session.
+                        // However, if we haven't managed to send anything so far,
+                        // closing and restarting the plan now would likely lead to
+                        // a persistent recurrence of this same state, so in that
+                        // situation we need to ensure that the reconnect_strategy
+                        // is applied to decide what to do.
+                        tracing::debug!(
+                            "{} sent a unilateral response: \
+                            {response:?}, treating the connection as closed",
+                            dispatcher.name
+                        );
+                        // Decide whether this is a successful plan
+                        self.update_state_for_reconnect(dispatcher);
+
+                        // if so, we can/should close the current session and start
+                        // a new one with a fresh plan
+                        if self.terminated_ok {
+                            let _ = self.close_connection(dispatcher).await;
+                            return Ok(
+                                AttemptConnectionDisposition::PeerClosedConnectionNeedNewSession,
+                            );
+                        }
+
+                        // otherwise, continue to next candidate host if that is what
+                        // the reconnect_strategy indicates.
+                        // While this is a return that leaves this function,
+                        // our caller will typically continue its loop and call
+                        // back in, but on the next call we won't show as connected
+                        // and will instead reach the logic below to make a new
+                        // connection in the current session, if that is what
+                        // the reconnect_strategy indicated.
+                        return Ok(
+                            AttemptConnectionDisposition::PeerClosedConnectionContinueSession,
+                        );
+                    }
+                    Err(err) => {
+                        // We got a transport error of some kind.
+                        // update_state_for_reconnect applies any reconnect_strategy
+                        // which will decide whether we continue with the connection
+                        // plan or whether we need to go to a new session.
+                        tracing::debug!(
+                            "{} had error: {err:#} \
+                            while checking for liveness, treating it as closed",
+                            dispatcher.name
+                        );
+                        self.update_state_for_reconnect(dispatcher);
+                        return Ok(
+                            AttemptConnectionDisposition::PeerClosedConnectionContinueSession,
+                        );
+                    }
+                };
             }
         }
 
@@ -311,6 +468,8 @@ impl SmtpDispatcher {
                     .await?;
 
                 if let Some(delay) = result.retry_after {
+                    dispatcher
+                        .enter_phase(crate::ready_queue::DispatcherPhase::ConnectionRateThrottled);
                     dispatcher
                         .states
                         .lock()
@@ -344,7 +503,7 @@ impl SmtpDispatcher {
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {},
                         _ = shutdown.shutting_down() => {
-                            return Err(ShuttingDownError.into());
+                            return Err(ShuttingDownError::new("waiting for max_connection_rate").into());
                         }
                     };
                 } else {
@@ -352,6 +511,7 @@ impl SmtpDispatcher {
                 }
             }
             dispatcher.states.lock().connection_rate_throttled.take();
+            dispatcher.enter_phase(crate::ready_queue::DispatcherPhase::AttemptingConnection);
         }
 
         let connection_wrapper = dispatcher.metrics.wrap_connection(());
@@ -465,9 +625,10 @@ impl SmtpDispatcher {
         };
 
         self.source_address.take();
+        dispatcher.set_detail("connect+banner");
         let (mut client, source_address) = tokio::select! {
             _ = shutdown.shutting_down() => {
-                return Err(ShuttingDownError.into());
+                return Err(ShuttingDownError::new("waiting for new connection").into());
             }
             result = make_connection => { result? },
         }
@@ -476,6 +637,7 @@ impl SmtpDispatcher {
 
         // Say EHLO/LHLO
         let helo_verb = if path_config.use_lmtp { "LHLO" } else { "EHLO" };
+        dispatcher.set_detail(helo_verb);
         let pretls_caps = client
             .ehlo_lhlo(&ehlo_name, path_config.use_lmtp)
             .await
@@ -487,6 +649,11 @@ impl SmtpDispatcher {
 
         let mut dane_tlsa = vec![];
         let mut mta_sts_eligible = true;
+        // Set when DANE published TLSA records that turned out to be unusable:
+        // STARTTLS is then mandatory (the host committed to TLS) even though we
+        // cannot authenticate it, so MTA-STS may add authentication but must not
+        // relax the requirement back to opportunistic.
+        let mut dane_requires_starttls = false;
 
         let mut certificate_from_pem = None;
         let mut private_key_from_pem = None;
@@ -505,33 +672,119 @@ impl SmtpDispatcher {
         let rustls_cipher_suites = path_config.rustls_cipher_suites.clone();
 
         if path_config.enable_dane {
-            if let Some(mx) = &dispatcher.mx {
-                match dns_resolver::resolve_dane(&mx.domain_name, port).await {
-                    Ok(tlsa) => {
-                        dane_tlsa = tlsa;
+            // RFC 7672 sections 2.1/2.2: DANE only applies when the chain to
+            // the MX host was securely resolved. The host selection is trusted
+            // when it came from a DNSSEC-validated MX RRset, or when it is a
+            // locally-configured mx_list that the operator marked trusted via
+            // treat_mx_list_as_secure. In either case DANE additionally requires
+            // the host's address records to have been securely (DNSSEC)
+            // resolved; the TLSA records are queried against the MX host
+            // (RFC 7672 section 3.2.2), not the envelope/routing domain.
+            let mx_selection_secure = match &dispatcher.mx {
+                Some(mx) => mx.is_secure,
+                // No DNS MX RRset: a locally-configured mx_list, trusted only
+                // when the operator opted in via treat_mx_list_as_secure.
+                None => self.treat_mx_list_as_secure,
+            };
+            let dane_eligible = if mx_selection_secure && address.is_secure {
+                true
+            } else if mx_selection_secure {
+                // The MX selection was secure but the MX host's address chain
+                // was not. Per RFC 7672 section 2.2.2 the host is still
+                // DANE-eligible if it is a securely published CNAME alias whose
+                // target merely lands in an unsigned zone; the securely
+                // published TLSA RRset, not the address records, authenticates
+                // the peer. An explicit CNAME lookup tells us whether that is
+                // the case.
+                match dns_resolver::resolve_secure_cname(&address.name).await? {
+                    SecureCnameStatus::SecureAlias => {
                         self.tracer.diagnostic(Level::INFO, || {
-                            format!("DANE records for {} are: {dane_tlsa:?}", mx.domain_name)
+                            format!(
+                                "{} resolves via a secure CNAME into an insecure \
+                                 zone; DANE remains eligible at the original name \
+                                 (RFC 7672 section 2.2.2)",
+                                address.name
+                            )
                         });
-                        if !dane_tlsa.is_empty() {
-                            enable_tls = Tls::Required;
-                            // Do not use MTA-STS when there are DANE results
-                            mta_sts_eligible = false;
-                        }
+                        true
                     }
-                    Err(err) => {
-                        // Do not use MTA-STS when DANE results have been tampered
-                        mta_sts_eligible = false;
-                        self.tracer.diagnostic(Level::INFO, || {
-                            format!("DANE resolve error for {}: {err:#}", mx.domain_name)
-                        });
-                        tracing::error!("DANE result for {}: {err:#}", mx.domain_name);
-                        // TODO: should we prevent continuing in the clear here? probably
+                    SecureCnameStatus::NotSecureAlias => false,
+                    SecureCnameStatus::TempFail(reason) => {
+                        record_dane_result("tempfail");
+                        // Downgrade resistance: when the CNAME status cannot be
+                        // securely determined we must not continue without
+                        // authentication. Defer instead.
+                        let message = format!(
+                            "DANE CNAME lookup for {} could not be securely \
+                                 resolved: {reason}",
+                            address.name
+                        );
+                        self.tracer.diagnostic(Level::INFO, || message.clone());
+                        anyhow::bail!("{message}");
                     }
                 }
             } else {
+                false
+            };
+
+            if dane_eligible {
+                match dns_resolver::resolve_dane(&address.name, port).await? {
+                    DaneStatus::Records(tlsa) => {
+                        record_dane_result("ok");
+                        dane_tlsa = tlsa;
+                        self.tracer.diagnostic(Level::INFO, || {
+                            format!("DANE records for {} are: {dane_tlsa:?}", address.name)
+                        });
+                        enable_tls = Tls::Required;
+                        // Do not use MTA-STS when we have usable DANE records
+                        mta_sts_eligible = false;
+                    }
+                    DaneStatus::Unusable => {
+                        record_dane_result("unusable");
+                        // RFC 7672 section 4.1: TLSA records are published
+                        // but none are usable; STARTTLS is required but we
+                        // cannot authenticate the peer. The domain has no
+                        // usable DANE policy, so MTA-STS may still apply as
+                        // an authentication fallback (but must not relax the
+                        // mandatory STARTTLS).
+                        self.tracer.diagnostic(Level::INFO, || {
+                            format!(
+                                "DANE TLSA records for {} exist but none are usable; \
+                                     requiring unauthenticated STARTTLS",
+                                address.name
+                            )
+                        });
+                        enable_tls = Tls::RequiredInsecure;
+                        dane_requires_starttls = true;
+                    }
+                    DaneStatus::TempFail(reason) => {
+                        record_dane_result("tempfail");
+                        // Downgrade resistance: when the TLSA status cannot
+                        // be securely determined we must not continue
+                        // without authentication. Defer instead.
+                        let message = format!(
+                            "DANE TLSA lookup for {} could not be securely \
+                                 resolved: {reason}",
+                            address.name
+                        );
+                        self.tracer.diagnostic(Level::INFO, || message.clone());
+                        anyhow::bail!("{message}");
+                    }
+                    DaneStatus::NotApplicable => {
+                        record_dane_result("not_applicable");
+                        self.tracer.diagnostic(Level::INFO, || {
+                            format!("{} is not DANE-eligible", address.name)
+                        });
+                    }
+                }
+            } else {
+                record_dane_result("insecure_chain");
                 self.tracer.diagnostic(Level::INFO, || {
                     format!(
-                        "DANE is enabled for this path, but it is not using MX records from DNS"
+                        "DANE is enabled but the chain to {} is not fully \
+                             DNSSEC-secure (mx_selection_secure={mx_selection_secure}, \
+                             address_secure={}); not using DANE",
+                        address.name, address.is_secure
                     )
                 });
             }
@@ -540,52 +793,33 @@ impl SmtpDispatcher {
                 .diagnostic(Level::INFO, || format!("DANE is not enabled for this path"));
         }
 
-        // Figure out MTA-STS policy.
+        // Apply the TLS posture from any MTA-STS policy that was resolved
+        // during MX resolution. Host gating is already structural: resolution
+        // pruned disallowed hosts and isolated impossible domains, so the
+        // pinned mx's policy is always satisfiable by the candidate hosts.
+        // We consult it here only for TLS posture, and only when this egress
+        // path opts in via enable_mta_sts. The `mta_sts_eligible` guard
+        // preserves DANE precedence (DANE clears it when TLSA is present).
         if mta_sts_eligible && path_config.enable_mta_sts {
-            if let Some(mx) = &dispatcher.mx {
-                match mta_sts::get_policy_for_domain(&mx.domain_name).await {
-                    Ok(policy) => {
-                        self.tracer.diagnostic(Level::INFO, || {
-                            format!("MTA-STS policy for {} is {:?}", mx.domain_name, policy.mode)
-                        });
-
-                        match policy.mode {
-                            PolicyMode::Enforce => {
-                                enable_tls = Tls::Required;
-                                if !policy.mx_name_matches(&address.name) {
-                                    anyhow::bail!(
-                                        "MTA-STS policy for {domain} is set to \
-                                     enforce but the current MX candidate \
-                                     {mx_host} does not match the list of allowed \
-                                     hosts. {policy:?}",
-                                        domain = mx.domain_name,
-                                        mx_host = address.name
-                                    );
-                                }
-                            }
-                            PolicyMode::Testing => {
-                                enable_tls = Tls::OpportunisticInsecure;
-                            }
-                            PolicyMode::None => {}
-                        }
-                    }
-                    Err(err) => {
-                        self.tracer.diagnostic(Level::INFO, || {
-                            format!("MTA-STS resolve error for {}: {err:#}", mx.domain_name)
-                        });
-                    }
+            match dispatcher.mx.as_ref().map(|mx| mx.mta_sts) {
+                Some(PolicyMode::Enforce) => {
+                    enable_tls = Tls::Required;
+                    self.tracer.diagnostic(Level::INFO, || {
+                        "MTA-STS enforce policy in effect; requiring TLS".to_string()
+                    });
                 }
-            } else {
-                self.tracer.diagnostic(Level::INFO, || {
-                    format!(
-                        "MTA-STS is enabled for this path, but it is not using MX records from DNS"
-                    )
-                });
+                Some(PolicyMode::Testing) => {
+                    // Don't relax a mandatory STARTTLS established by
+                    // unusable DANE TLSA records.
+                    if !dane_requires_starttls {
+                        enable_tls = Tls::OpportunisticInsecure;
+                    }
+                    self.tracer.diagnostic(Level::INFO, || {
+                        "MTA-STS testing policy in effect".to_string()
+                    });
+                }
+                None | Some(PolicyMode::None) => {}
             }
-        } else {
-            self.tracer.diagnostic(Level::INFO, || {
-                format!("MTA-STS is not enabled for this path")
-            });
         }
 
         let prefer_openssl = path_config.tls_prefer_openssl;
@@ -627,6 +861,7 @@ impl SmtpDispatcher {
                 false
             }
             (Tls::OpportunisticInsecure, AdvTls::Yes, BrokenTls::No) => {
+                dispatcher.set_detail("STARTTLS");
                 let (enabled, label) = match client
                     .starttls(TlsOptions {
                         insecure: enable_tls.allow_insecure(),
@@ -704,6 +939,7 @@ impl SmtpDispatcher {
                 _, /* don't care if we think tls is broken when policy is required */
             )
             | (Tls::Opportunistic, AdvTls::Yes, BrokenTls::No) => {
+                dispatcher.set_detail("STARTTLS");
                 match client
                     .starttls(TlsOptions {
                         insecure: enable_tls.allow_insecure(),
@@ -727,7 +963,7 @@ impl SmtpDispatcher {
                         // be busted by the failed handshake and never succeed
                         tokio::time::timeout(
                             tokio::time::Duration::from_secs(2),
-                            client.send_command(&rfc5321::Command::Quit),
+                            client.send_command(&rfc5321::parser::Command::Quit),
                         )
                         .await
                         .ok();
@@ -780,10 +1016,27 @@ impl SmtpDispatcher {
         };
 
         if let Some(username) = &path_config.smtp_auth_plain_username {
-            if !tls_enabled && !path_config.allow_smtp_auth_plain_without_tls {
-                anyhow::bail!(
-                    "TLS is not enabled and AUTH PLAIN is required. Skipping ({address:?}:{port})"
-                );
+            if !tls_enabled {
+                if !path_config.allow_smtp_auth_plain_without_tls {
+                    anyhow::bail!(
+                        "TLS is not enabled and AUTH PLAIN is required. Skipping ({address:?}:{port})"
+                    );
+                }
+            } else {
+                // The session is encrypted; refuse to send credentials unless
+                // the peer certificate was validated, otherwise an active
+                // attacker could capture them.
+                let validated = self
+                    .tls_info
+                    .as_ref()
+                    .map(|info| info.authenticated)
+                    .unwrap_or(false);
+                if !validated && !path_config.allow_smtp_auth_plain_without_valid_certificate {
+                    anyhow::bail!(
+                        "TLS peer certificate was not validated and AUTH PLAIN \
+                         requires a valid certificate. Skipping ({address:?}:{port})"
+                    );
+                }
             }
 
             let password = if let Some(pw) = &path_config.smtp_auth_plain_password {
@@ -799,6 +1052,7 @@ impl SmtpDispatcher {
                 None
             };
 
+            dispatcher.set_detail("AUTH PLAIN");
             client
                 .auth_plain(username, password.as_deref())
                 .await
@@ -813,7 +1067,7 @@ impl SmtpDispatcher {
             .replace(connection_wrapper.map_connection(client));
         self.client_address.replace(address);
         dispatcher.delivered_this_connection = 0;
-        Ok(())
+        Ok(AttemptConnectionDisposition::ConnectedNew)
     }
 
     async fn resolve_cached_client_cert(
@@ -881,7 +1135,7 @@ impl SmtpDispatcher {
             source_address: self.source_address.clone(),
             provider: dispatcher.path_config.borrow().provider_name.as_deref(),
             session_id: Some(dispatcher.session_id),
-            recipient_list: recipient_list,
+            recipient_list,
         })
         .await
     }
@@ -924,7 +1178,10 @@ impl SmtpDispatcher {
 impl QueueDispatcher for SmtpDispatcher {
     async fn close_connection(&mut self, _dispatcher: &mut Dispatcher) -> anyhow::Result<bool> {
         if let Some(mut client) = self.client.take() {
-            client.send_command(&rfc5321::Command::Quit).await.ok();
+            client
+                .send_command(&rfc5321::parser::Command::Quit)
+                .await
+                .ok();
             // Close out this dispatcher and let the maintainer spawn
             // a new connection
             Ok(true)
@@ -939,7 +1196,10 @@ impl QueueDispatcher for SmtpDispatcher {
         self.terminated_ok
     }
 
-    async fn attempt_connection(&mut self, dispatcher: &mut Dispatcher) -> anyhow::Result<()> {
+    async fn attempt_connection(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+    ) -> anyhow::Result<AttemptConnectionDisposition> {
         self.attempt_connection_impl(dispatcher)
             .await
             .map_err(|err| {
@@ -973,10 +1233,12 @@ impl QueueDispatcher for SmtpDispatcher {
             .sender()
             .await?
             .try_into()
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+            .map_err(|err: &str| anyhow::anyhow!("{err}"))?;
         let mut recipients: Vec<ForwardPath> = vec![];
         for recip in msg.recipient_list().await? {
-            let recip: ForwardPath = recip.try_into().map_err(|err| anyhow::anyhow!("{err:#}"))?;
+            let recip: ForwardPath = recip
+                .try_into()
+                .map_err(|err: &str| anyhow::anyhow!("{err:#}"))?;
             recips_this_txn.insert(
                 (spool_id, recip.clone()),
                 1 + self
@@ -1039,11 +1301,37 @@ impl QueueDispatcher for SmtpDispatcher {
             if recipients_this_batch.len() < path_config.max_recipients_per_batch {
                 recipients_this_batch.push(recip);
             } else {
-                revised_recipient_list.push(recip.into());
+                revised_recipient_list.push(EnvelopeAddress::from(recip));
                 // The excess is ready to go immediately
                 retry_immediately = true;
             }
         }
+
+        // Race protection: the load-shedding gate may have latched
+        // between obtain_message and here.  If so, do not start a
+        // new SMTP transaction -- log the hold against this message
+        // and let the dispatcher's normal "no more messages" path
+        // (obtain_message at the top of the next loop iteration)
+        // close the SMTP session.
+        if let Some(reason) = crate::spool::delivery_suspension_reason() {
+            let id = *msg.id();
+            if let Err(err) = crate::spool::log_and_requeue_for_unhealthy_spool(
+                msg,
+                &dispatcher.name,
+                Some(dispatcher.session_id),
+                reason,
+            )
+            .await
+            {
+                tracing::error!("failed to requeue {id} while spool is unhealthy: {err:#}");
+            }
+            return Ok(());
+        }
+
+        dispatcher.set_detail(format!(
+            "send msg with {} recip(s)",
+            recipients_this_batch.len()
+        ));
 
         let send_result = self
             .client
@@ -1114,7 +1402,7 @@ impl QueueDispatcher for SmtpDispatcher {
                             detail: 2,
                         }),
                         content: reason.clone(),
-                        command: command.as_ref().map(|c| c.encode()),
+                        command: command.as_ref().map(|c| c.encode().to_string()),
                     });
                 }
             }
@@ -1231,7 +1519,7 @@ impl QueueDispatcher for SmtpDispatcher {
             };
 
             if record_type == RecordType::TransientFailure {
-                revised_recipient_list.push(recipient.clone().into());
+                revised_recipient_list.push(EnvelopeAddress::from(recipient.clone()));
             }
             if record_type != RecordType::Delivery && overall_response.is_none() {
                 overall_response.replace(response.clone());

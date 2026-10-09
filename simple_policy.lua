@@ -48,16 +48,17 @@ sources:setup {
 }
 
 local queue_module = require 'policy-extras.queue'
+
 local queue_helper = queue_module:setup {
   -- '/tmp/invalid/file.toml',
   {
     scheduling_header = 'X-Schedule',
-    tenant = {
+    tenants = {
       mytenant = {
         egress_pool = 'pool0',
       },
     },
-    queue = {
+    queues = {
       default = {
         egress_pool = 'pool0',
         -- refresh_interval = '2 hours',
@@ -175,11 +176,6 @@ kumo.on('init', function()
   -- 'flush' can be set to true to cause fdatasync to be
   -- triggered after each store to the spool.
   -- The increased durability comes at the cost of throughput.
-  --
-  -- kind can be 'LocalDisk' (currently the default) or 'RocksDB'.
-  --
-  -- LocalDisk stores one file per message in a filesystem hierarchy.
-  -- RocksDB is a key-value datastore.
   --
   -- RocksDB has >4x the throughput of LocalDisk, and enabling
   -- flush has a marginal (<10%) impact in early testing.

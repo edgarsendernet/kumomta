@@ -1,11 +1,12 @@
 #![allow(clippy::result_large_err)]
 use crate::client_types::*;
-use crate::{
-    AsyncReadAndWrite, BoxedAsyncReadAndWrite, Command, Domain, EsmtpParameter, ForwardPath,
-    ReversePath,
-};
+use crate::parser::{Command, Domain, EsmtpParameter, ForwardPath, ReversePath};
+use crate::{AsyncReadAndWrite, BoxedAsyncReadAndWrite};
+use bstr::ByteSlice;
 use hickory_proto::rr::rdata::TLSA;
+use hickory_proto::rr::Name;
 use memchr::memmem::Finder;
+use nom_utils::DomainString;
 use openssl::x509::{X509Ref, X509};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,12 +17,13 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::Level;
 
 pub use kumo_tls_helper::TlsOptions;
-pub use {openssl, tokio_rustls};
+pub use openssl;
+pub use tokio_rustls;
 
 const MAX_LINE_LEN: usize = 4096;
 
@@ -85,12 +87,15 @@ impl ClientError {
             | Self::ReadError {
                 command: Some(command),
                 ..
-            } => Some(command.encode()),
+            } => Some(command.encode().to_string()),
             Self::TimeOutRequest { commands, .. } | Self::WriteError { commands, .. }
                 if !commands.is_empty() =>
             {
-                let commands: Vec<String> = commands.into_iter().map(|cmd| cmd.encode()).collect();
-                Some(commands.join(""))
+                let s: String = commands
+                    .iter()
+                    .map(|cmd| cmd.encode().to_string())
+                    .collect();
+                Some(s)
             }
             _ => None,
         }
@@ -354,13 +359,21 @@ impl SmtpClient {
                         });
                     }
                     Err(_) => {
-                        self.socket.take();
+                        // If we're using a zero timeout we're probing
+                        // for liveness, so we don't want to treat this
+                        // timeout as a fatal error that closes the
+                        // connection
+                        if timeout_duration != Duration::ZERO {
+                            self.socket.take();
+                        }
                         if let Some(tracer) = &self.tracer {
                             tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
                                 level: Level::ERROR,
                                 message: format!("Read Timeout after {timeout_duration:?}"),
                             });
-                            tracer.trace_event(SmtpClientTraceEvent::Closed);
+                            if self.socket.is_none() {
+                                tracer.trace_event(SmtpClientTraceEvent::Closed);
+                            }
                         }
                         return Err(ClientError::TimeOutResponse {
                             command: cmd.cloned(),
@@ -396,44 +409,82 @@ impl SmtpClient {
         }
     }
 
+    /// Check to see if there is either a unilateral response
+    /// or an error condition immediately available on the socket.
+    ///
+    /// Intended to be used after the connection has idled to see if
+    /// the peer has opted to close the connection, either gracefully
+    /// by sending what should be a 421, or abruptly by simply snipping
+    /// the connection.
+    pub async fn check_unilateral_response(&mut self) -> Result<Option<Response>, ClientError> {
+        match self.read_response(None, Duration::ZERO).await {
+            // Unilateral response was received
+            Ok(response) => Ok(Some(response)),
+            // Nothing immediately available: this should hopefully be the common case
+            Err(ClientError::TimeOutResponse { .. }) => Ok(None),
+            // An actual error
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn read_response(
         &mut self,
         command: Option<&Command>,
         timeout_duration: Duration,
     ) -> Result<Response, ClientError> {
+        let deadline = Instant::now() + timeout_duration;
+
         if let Some(sock) = self.socket.as_mut() {
-            if let Err(err) = sock.flush().await {
-                self.socket.take();
-                if let Some(tracer) = &self.tracer {
-                    tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
-                        level: Level::ERROR,
-                        message: format!("Error during flush: {err:#}"),
+            match timeout_at(deadline, sock.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    self.socket.take();
+                    if let Some(tracer) = &self.tracer {
+                        tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
+                            level: Level::ERROR,
+                            message: format!("Error during flush: {err:#}"),
+                        });
+                        tracer.trace_event(SmtpClientTraceEvent::Closed);
+                    }
+                    return Err(ClientError::FlushError {
+                        error: format!("{err:#}"),
                     });
-                    tracer.trace_event(SmtpClientTraceEvent::Closed);
                 }
-                return Err(ClientError::FlushError {
-                    error: format!("{err:#}"),
-                });
+                Err(_elapsed) => {
+                    self.socket.take();
+                    if let Some(tracer) = &self.tracer {
+                        tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
+                            level: Level::ERROR,
+                            message: format!("Flush timed out after {timeout_duration:?}"),
+                        });
+                        tracer.trace_event(SmtpClientTraceEvent::Closed);
+                    }
+                    return Err(ClientError::TimeOutResponse {
+                        command: command.cloned(),
+                        duration: timeout_duration,
+                    });
+                }
             }
         }
 
-        let mut line = self.read_line(timeout_duration, command).await?;
+        let mut line = self
+            .read_line(deadline.saturating_duration_since(Instant::now()), command)
+            .await?;
         tracing::trace!("recv<-{}: {line}", self.hostname);
         let mut parsed = parse_response_line(&line)?;
         let mut response_builder = ResponseBuilder::new(&parsed);
 
-        let subsequent_line_timeout_duration = Duration::from_secs(60).min(timeout_duration);
         while !parsed.is_final {
-            line = self
-                .read_line(subsequent_line_timeout_duration, command)
-                .await?;
+            let per_line =
+                Duration::from_secs(60).min(deadline.saturating_duration_since(Instant::now()));
+            line = self.read_line(per_line, command).await?;
             parsed = parse_response_line(&line)?;
             response_builder
                 .add_line(&parsed)
                 .map_err(ClientError::MalformedResponseLine)?;
         }
 
-        let response = response_builder.build(command.map(|cmd| cmd.encode()));
+        let response = response_builder.build(command.map(|cmd| cmd.encode().to_string()));
 
         tracing::trace!("{}: {response:?}", self.hostname);
 
@@ -499,25 +550,29 @@ impl SmtpClient {
             .sum();
 
         let mut lines: Vec<String> = vec![];
-        let mut all = String::new();
+        let mut all: Vec<u8> = vec![];
         for cmd in commands {
             let line = cmd.encode();
-            all.push_str(&line);
-            lines.push(line);
+            all.extend_from_slice(&line);
+            lines.push(line.to_string());
         }
-        tracing::trace!("send->{}: (PIPELINE) {all}", self.hostname);
+        tracing::trace!(
+            "send->{}: (PIPELINE) {}",
+            self.hostname,
+            all.as_bstr().escape_bytes()
+        );
         if self.socket.is_some() {
             if let Some(tracer) = &self.tracer {
                 // Send the lines individually to the tracer, so that we
                 // don't break --terse mode
-                for line in lines {
-                    WriteTracer::trace(tracer, &line);
+                for line in &lines {
+                    WriteTracer::trace(tracer, line);
                 }
             }
         }
         self.write_all_with_timeout(
             total_timeout,
-            all.as_bytes(),
+            &all,
             || ClientError::TimeOutRequest {
                 duration: total_timeout,
                 commands: commands.to_vec(),
@@ -535,14 +590,14 @@ impl SmtpClient {
         tracing::trace!("send->{}: {line}", self.hostname);
         if self.socket.is_some() {
             if let Some(tracer) = &self.tracer {
-                WriteTracer::trace(tracer, &line);
+                WriteTracer::trace(tracer, &line.to_string());
             }
         }
 
         let timeout_duration = command.client_timeout_request(&self.timeouts);
         self.write_all_with_timeout(
             timeout_duration,
-            line.as_bytes(),
+            &line,
             || ClientError::TimeOutRequest {
                 duration: timeout_duration,
                 commands: vec![command.clone()],
@@ -654,7 +709,11 @@ impl SmtpClient {
         ehlo_name: &str,
     ) -> Result<&HashMap<String, EsmtpCapability>, ClientError> {
         let response = self
-            .send_command(&Command::Lhlo(Domain::Name(ehlo_name.to_string())))
+            .send_command(&Command::Lhlo(Domain::DomainName(
+                ehlo_name
+                    .parse::<DomainString>()
+                    .map_err(|_| ClientError::InvalidDnsName(ehlo_name.to_string()))?,
+            )))
             .await?;
         self.ehlo_common(response)
     }
@@ -664,7 +723,11 @@ impl SmtpClient {
         ehlo_name: &str,
     ) -> Result<&HashMap<String, EsmtpCapability>, ClientError> {
         let response = self
-            .send_command(&Command::Ehlo(Domain::Name(ehlo_name.to_string())))
+            .send_command(&Command::Ehlo(Domain::DomainName(
+                ehlo_name
+                    .parse::<DomainString>()
+                    .map_err(|_| ClientError::InvalidDnsName(ehlo_name.to_string()))?,
+            )))
             .await?;
         self.ehlo_common(response)
     }
@@ -754,8 +817,35 @@ impl SmtpClient {
 
             let mut ssl_stream = tokio_openssl::SslStream::new(ssl, stream)?;
 
-            if let Err(err) = std::pin::Pin::new(&mut ssl_stream).connect().await {
-                handshake_error.replace(format!("{err:#}"));
+            match timeout(
+                self.timeouts.starttls_timeout,
+                std::pin::Pin::new(&mut ssl_stream).connect(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    handshake_error.replace(format!("{err:#}"));
+                }
+                Err(_elapsed) => {
+                    // The plaintext fallback below cannot succeed against
+                    // a peer whose TLS state is mid-handshake; hard-fail
+                    // like the rustls path does.
+                    if let Some(tracer) = &self.tracer {
+                        tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
+                            level: Level::ERROR,
+                            message: format!(
+                                "openssl handshake timed out after {:?}",
+                                self.timeouts.starttls_timeout
+                            ),
+                        });
+                        tracer.trace_event(SmtpClientTraceEvent::Closed);
+                    }
+                    return Err(ClientError::TimeOutResponse {
+                        command: Some(Command::StartTls),
+                        duration: self.timeouts.starttls_timeout,
+                    });
+                }
             }
 
             tls_info.provider_name = "openssl".to_string();
@@ -792,24 +882,16 @@ impl SmtpClient {
                     error: error.to_string(),
                 }
             })?;
-            let server_name = match IpAddr::from_str(self.hostname.as_str()) {
-                Ok(ip) => ServerName::IpAddress(ip.into()),
-                Err(_) => ServerName::try_from(self.hostname.clone())
-                    .map_err(|_| ClientError::InvalidDnsName(self.hostname.clone()))?,
+            let server_name = parse_server_name(self.hostname.as_str())?;
+
+            let socket = match self.socket.take() {
+                Some(s) => s,
+                None => return Err(ClientError::NotConnected),
             };
 
-            match connector
-                .connect(
-                    server_name,
-                    match self.socket.take() {
-                        Some(s) => s,
-                        None => return Err(ClientError::NotConnected),
-                    },
-                )
-                .into_fallible()
-                .await
-            {
-                Ok(stream) => {
+            let connect_future = connector.connect(server_name, socket).into_fallible();
+            match timeout(self.timeouts.starttls_timeout, connect_future).await {
+                Ok(Ok(stream)) => {
                     let (_, conn) = stream.get_ref();
                     tls_info.cipher = match conn.negotiated_cipher_suite() {
                         Some(suite) => suite.suite().as_str().unwrap_or("UNKNOWN").to_string(),
@@ -829,12 +911,33 @@ impl SmtpClient {
 
                     Box::new(stream)
                 }
-                Err((err, stream)) => {
+                Ok(Err((err, stream))) => {
                     handshake_error.replace(format!("{err:#}"));
                     stream
                 }
+                Err(_elapsed) => {
+                    if let Some(tracer) = &self.tracer {
+                        tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
+                            level: Level::ERROR,
+                            message: format!(
+                                "rustls handshake timed out after {:?}",
+                                self.timeouts.starttls_timeout
+                            ),
+                        });
+                        tracer.trace_event(SmtpClientTraceEvent::Closed);
+                    }
+                    return Err(ClientError::TimeOutResponse {
+                        command: Some(Command::StartTls),
+                        duration: self.timeouts.starttls_timeout,
+                    });
+                }
             }
         };
+
+        // On a successful handshake the peer was authenticated iff verification
+        // was required: when `insecure` is set we accept the peer's certificate
+        // without validating it, so the session is encrypted but unauthenticated.
+        tls_info.authenticated = !options.insecure;
 
         if let Some(tracer) = &self.tracer {
             tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
@@ -1091,6 +1194,11 @@ pub struct TlsInformation {
     pub protocol_version: String,
     pub subject_name: Vec<String>,
     pub provider_name: String,
+    /// Whether the peer certificate was authenticated (validated) as part of
+    /// the handshake. False when the session is encrypted but the peer was not
+    /// verified (e.g. opportunistic-insecure, or DANE with no usable TLSA
+    /// records).
+    pub authenticated: bool,
 }
 
 impl Drop for SmtpClient {
@@ -1143,7 +1251,7 @@ fn apply_dot_stuffing(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Extracts the object=name pairs of the subject name from a cert.
 /// eg:
-/// ```no_run
+/// ```text
 /// ["C=US", "ST=CA", "L=SanFrancisco", "O=Fort-Funston", "OU=MyOrganizationalUnit",
 /// "CN=do.havedane.net", "name=EasyRSA", "emailAddress=me@myhost.mydomain"]
 /// ```
@@ -1159,10 +1267,22 @@ pub fn subject_name(cert: &X509Ref) -> Vec<String> {
     subject_name
 }
 
+fn parse_server_name(input: &str) -> Result<ServerName<'static>, ClientError> {
+    match IpAddr::from_str(input) {
+        Ok(ip) => Ok(ServerName::IpAddress(ip.into())),
+        Err(_) => {
+            let name = Name::from_str_relaxed(input)
+                .map_err(|_| ClientError::InvalidDnsName(input.to_string()))?;
+            ServerName::try_from(name.to_ascii())
+                .map_err(|_| ClientError::InvalidDnsName(name.to_ascii()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{MailPath, Mailbox};
+    use crate::parser::{EnvelopeAddress, ReversePath};
 
     #[test]
     fn test_stuffing() {
@@ -1343,13 +1463,14 @@ mod test {
                 "{:#}",
                 ClientError::TimeOutResponse {
                     command: Some(Command::MailFrom {
-                        address: ReversePath::Path(MailPath {
-                            at_domain_list: vec![],
-                            mailbox: Mailbox {
-                                local_part: "user".to_string(),
-                                domain: Domain::Name("host".to_string())
-                            }
-                        }),
+                        address: {
+                            let EnvelopeAddress::Path(p) =
+                                EnvelopeAddress::parse("user@host").unwrap()
+                            else {
+                                panic!("expected Path")
+                            };
+                            ReversePath::Path(p)
+                        },
                         parameters: vec![],
                     }),
                     duration: Duration::from_secs(10),
@@ -1357,5 +1478,10 @@ mod test {
             ),
             r#"Timed Out waiting 10s for response to cmd=MAIL FROM:<user@host>"#
         );
+    }
+
+    #[test]
+    fn test_issue_533() {
+        let _name = parse_server_name("münchen.de").unwrap();
     }
 }

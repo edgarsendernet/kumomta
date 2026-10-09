@@ -1,7 +1,7 @@
 use crate::delivery_metrics::MetricsWrappedConnection;
 use crate::logging::disposition::{log_disposition, LogDisposition, RecordType};
 use crate::queue::{DeliveryProto, QueueConfig, QueueManager};
-use crate::ready_queue::{Dispatcher, QueueDispatcher};
+use crate::ready_queue::{AttemptConnectionDisposition, Dispatcher, QueueDispatcher};
 use crate::smtp_server::{default_hostname, TraceHeaders};
 use crate::spool::SpoolManager;
 use anyhow::Context;
@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use axum::extract::{Json, State};
 use axum_client_ip::ClientIp;
 use config::{any_err, get_or_create_sub_module, load_config, LuaConfig, SerdeWrappedValue};
+use kumo_api_types::InjectV1Response;
 use kumo_chrono_helper::Utc;
 use kumo_log_types::ResolvedAddress;
 use kumo_prometheus::AtomicCounter;
@@ -18,10 +19,14 @@ use kumo_server_common::http_server::{AppError, AppState};
 use kumo_server_lifecycle::Activity;
 use kumo_server_runtime::{Runtime, RUNTIME};
 use kumo_template::{CompiledTemplates, TemplateDialect, TemplateEngine, TemplateList};
-use mailparsing::{AddrSpec, Address, EncodeHeaderValue, Mailbox, MessageBuilder, MimePart};
-use message::{EnvelopeAddress, Message};
+use mailparsing::{
+    is_address_header_name, AddrSpec, Address, EncodeHeaderValue, Mailbox, MessageBuilder,
+    MimePart, ParsedHeader,
+};
+use message::Message;
 use mlua::{Lua, LuaSerdeExt};
 use reqwest::StatusCode;
+use rfc5321::parser::EnvelopeAddress;
 use rfc5321::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,7 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use throttle::ThrottleSpec;
-use utoipa::{ToResponse, ToSchema};
+use utoipa::ToSchema;
 
 config::declare_event! {
 static HTTP_MESSAGE_GENERATED: Single(
@@ -114,14 +119,30 @@ pub struct Recipient {
     /// When using templating, this is the map of placeholder
     /// name to replacement value that should be used by the
     /// templating engine when processing just this recipient.
-    /// Note that `name` is implicitly set from the `name`
-    /// field, so you do not need to duplicate it here.
+    ///
+    /// The following substitutions are pre-defined:
+    ///
+    /// |Name|Value|Version|
+    /// |----|-----|-------|
+    /// |email|Populated from the recipient `email` field|Always|
+    /// |name|Populated from the recipient `name` field|Always|
+    /// |to_header|A suitable value for use in a `To:` header, constructed from the recipient `email` and `name` fields. eg: `"John Smith" <john.smith@mailbox-example.com>`|{{since('2026.04.09-ea3b2a9b', inline=True)}}|
     #[serde(default)]
     #[schema(additional_properties, example=json!({
         "age": 42,
         "gender": "male",
     }))]
     pub substitutions: HashMap<String, Value>,
+
+    /// Per-recipient metadata key-value pairs. When non-empty, these are
+    /// stored on the resulting message under the `extra` metadata key,
+    /// accessible from Lua hooks via `msg:get_meta('extra')`.
+    #[serde(default)]
+    #[schema(additional_properties, example=json!({
+        "campaign_id": "promo-2026-q2",
+        "user_segment": "premium",
+    }))]
+    pub metadata: HashMap<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
@@ -141,7 +162,7 @@ pub struct InjectV1Request {
     ///
     /// |Behavior|Version|
     /// |--------|-------|
-    /// |The per-recipient `To` header will not be generated|{{since('dev', inline=True)}}|
+    /// |The per-recipient `To` header will not be generated|{{since('2026.03.04-bb93ecb1', inline=True)}}|
     /// |Two `To` headers will be generated|All previous versions|
     pub recipients: Vec<Recipient>,
 
@@ -355,29 +376,14 @@ pub enum TemplateDialectWithSchema {
     Handlebars,
 }
 
-impl Into<TemplateDialect> for TemplateDialectWithSchema {
-    fn into(self) -> TemplateDialect {
-        match self {
-            Self::Jinja => TemplateDialect::Jinja,
-            Self::Static => TemplateDialect::Static,
-            Self::Handlebars => TemplateDialect::Handlebars,
+impl From<TemplateDialectWithSchema> for TemplateDialect {
+    fn from(val: TemplateDialectWithSchema) -> Self {
+        match val {
+            TemplateDialectWithSchema::Jinja => TemplateDialect::Jinja,
+            TemplateDialectWithSchema::Static => TemplateDialect::Static,
+            TemplateDialectWithSchema::Handlebars => TemplateDialect::Handlebars,
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, ToResponse, ToSchema)]
-pub struct InjectV1Response {
-    /// The number of messages that were injected successfully
-    pub success_count: usize,
-    /// The number of messages that failed to inject
-    pub fail_count: usize,
-
-    /// The list of failed recipients
-    #[schema(format = "email")]
-    pub failed_recipients: Vec<String>,
-
-    /// The list of error messages
-    pub errors: Vec<String>,
 }
 
 /// The message content.
@@ -403,7 +409,7 @@ pub enum Content {
         html_body: Option<String>,
 
         /// If set, will be used to create a text/x-amp-html part.
-        /// This is available {{since('dev', inline=True)}}
+        /// This is available {{since('2026.03.04-bb93ecb1', inline=True)}}
         #[serde(default)]
         #[schema(example = "<!doctype html><html amp4email>...</html>")]
         amp_html_body: Option<String>,
@@ -471,6 +477,10 @@ pub struct Attachment {
 struct Compiled<'a> {
     env_and_templates: CompiledTemplates,
     attached: Vec<MimePart<'a>>,
+    /// Validated addr-specs for the headers whose display name is templated
+    /// and encoded per recipient (content.from, content.reply_to), keyed by
+    /// the header name the name template is stored under.
+    constructed_addresses: BTreeMap<String, AddrSpec>,
 }
 
 impl<'a> Compiled<'a> {
@@ -488,6 +498,15 @@ impl<'a> Compiled<'a> {
         if let Some(name) = &recip.name {
             subst.insert("name".to_string(), name.to_string().into());
         }
+
+        let to_mailbox = Address::Mailbox(Mailbox {
+            name: recip.name.clone(),
+            address: AddrSpec::parse(&recip.email)?,
+        });
+        subst.insert(
+            "to_header".to_string(),
+            to_mailbox.encode_value().to_string().into(),
+        );
 
         for (k, v) in &recip.substitutions {
             subst.insert(k.clone(), v.clone());
@@ -508,7 +527,7 @@ impl<'a> Compiled<'a> {
                     msg.headers_mut().set_mime_version("1.0")?;
                 }
 
-                Ok(msg.to_message_string())
+                Ok(String::from_utf8(msg.to_message_bytes()?)?)
             }
             Content::Builder {
                 text_body,
@@ -546,24 +565,47 @@ impl<'a> Compiled<'a> {
                     }
                     let expanded = self.env_and_templates.borrow_dependent()[id].render(&subst)?;
                     id += 1;
-                    builder.push(mailparsing::Header::new_unstructured(
-                        name.to_string(),
-                        expanded.to_string(),
-                    ));
+
+                    let header = if let Some(address) = self.constructed_addresses.get(name) {
+                        // Encode the mailbox after substitution to escape the
+                        // rendered name as a display name rather than parse it
+                        // as address syntax.
+                        let mailbox = Mailbox {
+                            name: (!expanded.is_empty()).then(|| expanded.to_string()),
+                            address: address.clone(),
+                        };
+                        mailparsing::Header::new(name.to_string(), Address::Mailbox(mailbox))
+                    } else if is_address_header_name(name.as_bytes()) && !expanded.trim().is_empty()
+                    {
+                        // Emit a user-supplied address header through the
+                        // address grammar: a non-ASCII display name becomes an
+                        // encoded-word around only the name, leaving the
+                        // addr-spec bare. new_unstructured would qp-encode the
+                        // whole value, wrapping the addr-spec in an
+                        // encoded-word that no address parser accepts. A blank
+                        // value is left to new_unstructured below, since the
+                        // address grammar requires at least one address.
+                        let parsed = ParsedHeader::structured(name.as_bytes(), expanded.as_bytes())
+                            .with_context(|| format!("parsing {name} header value {expanded:?}"))?;
+                        mailparsing::Header::new(name.to_string(), parsed)
+                    } else {
+                        mailparsing::Header::new_unstructured(
+                            name.to_string(),
+                            expanded.to_string(),
+                        )
+                    };
+                    builder.push(header);
                 }
 
                 if need_to {
-                    builder.set_to(Address::Mailbox(Mailbox {
-                        name: recip.name.clone(),
-                        address: AddrSpec::parse(&recip.email)?,
-                    }))?;
+                    builder.set_to(to_mailbox)?;
                 }
 
                 for part in &self.attached {
                     builder.attach_part(part.clone());
                 }
 
-                Ok(builder.build()?.to_message_string())
+                Ok(String::from_utf8(builder.build()?.to_message_bytes()?)?)
             }
         }
     }
@@ -584,20 +626,17 @@ impl InjectV1Request {
                 subject,
                 reply_to,
             } => {
+                // Store the raw, unencoded display name so template
+                // substitution runs before it is encoded. compile() pairs it
+                // with the parsed address.
                 if let Some(from) = from {
-                    let mailbox = Address::Mailbox(Mailbox {
-                        name: from.name.clone(),
-                        address: AddrSpec::parse(&from.email)?,
-                    });
-
-                    headers.insert("From".to_string(), mailbox.encode_value().to_string());
+                    headers.insert("From".to_string(), from.name.clone().unwrap_or_default());
                 }
                 if let Some(reply_to) = reply_to {
-                    let mailbox = Address::Mailbox(Mailbox {
-                        name: reply_to.name.clone(),
-                        address: AddrSpec::parse(&reply_to.email)?,
-                    });
-                    headers.insert("Reply-To".to_string(), mailbox.encode_value().to_string());
+                    headers.insert(
+                        "Reply-To".to_string(),
+                        reply_to.name.clone().unwrap_or_default(),
+                    );
                 }
                 if let Some(v) = subject {
                     headers.insert("Subject".to_string(), v.to_string());
@@ -682,7 +721,7 @@ impl InjectV1Request {
                         // The filename extension is needed to enable auto-escaping
                         templates.push(env.get_template("amp_html_body.html")?);
                     }
-                    for (header_name, _) in headers {
+                    for header_name in headers.keys() {
                         templates.push(env.get_template(&format!("headers[{header_name}]"))?);
                     }
                 }
@@ -692,6 +731,22 @@ impl InjectV1Request {
 
         let attached = self.attachment_data()?;
 
+        let mut constructed_addresses = BTreeMap::new();
+        if let Content::Builder { from, reply_to, .. } = &self.content {
+            if let Some(from) = from {
+                constructed_addresses.insert(
+                    "From".to_string(),
+                    AddrSpec::parse(&from.email).context("failed parsing content.from")?,
+                );
+            }
+            if let Some(reply_to) = reply_to {
+                constructed_addresses.insert(
+                    "Reply-To".to_string(),
+                    AddrSpec::parse(&reply_to.email).context("failed parsing content.reply_to")?,
+                );
+            }
+        }
+
         let env_and_templates = CompiledTemplates::try_new(env, |env: &TemplateEngine| {
             get_templates(env, &self.content)
         })?;
@@ -699,6 +754,7 @@ impl InjectV1Request {
         Ok(Compiled {
             env_and_templates,
             attached,
+            constructed_addresses,
         })
     }
 
@@ -709,9 +765,9 @@ impl InjectV1Request {
                 let mut attached = vec![];
                 for a in attachments {
                     let opts = mailparsing::AttachmentOptions {
-                        file_name: a.file_name.clone(),
+                        file_name: a.file_name.clone().map(|s| s.into()),
                         inline: a.content_id.is_some(),
-                        content_id: a.content_id.clone(),
+                        content_id: a.content_id.clone().map(Into::into),
                     };
 
                     let decoded_data;
@@ -754,7 +810,7 @@ async fn make_message<'a>(
     let id = SpoolId::new();
 
     let generated = if request.trace_headers.received_header {
-        let datestamp = Utc::now().to_rfc2822();
+        let datestamp = mailparsing::format_rfc2822_date(Utc::now());
         let from_domain = sender.domain();
         let recip = &recip.email;
         // I can see someone wanting more control over the hostname that
@@ -796,6 +852,14 @@ async fn make_message<'a>(
     }
     if let Some(hostname) = hostname {
         message.set_meta("hostname", hostname.to_string()).await?;
+    }
+    if !recip.metadata.is_empty() {
+        message
+            .set_meta(
+                "extra",
+                serde_json::Value::Object(recip.metadata.clone().into_iter().collect()),
+            )
+            .await?;
     }
     Ok(message)
 }
@@ -849,6 +913,7 @@ async fn process_recipient<'a>(
             peer_address: Some(&ResolvedAddress {
                 name: "".to_string(),
                 addr: peer_address.into(),
+                is_secure: false,
             }),
             response: Response {
                 code: 250,
@@ -913,6 +978,7 @@ async fn queue_deferred(
         peer_address: Some(&ResolvedAddress {
             name: "".to_string(),
             addr: peer_address.into(),
+            is_secure: false,
         }),
         response: Response {
             code: 250,
@@ -941,6 +1007,15 @@ async fn queue_deferred(
     })
 }
 
+fn content_syntax_err(err: anyhow::Error) -> AppError {
+    // UNPROCESSABLE_ENTITY is the label assigned by reqwest for a 422
+    // error response, but the spec refers to it as Unprocessable Content:
+    // <https://datatracker.ietf.org/doc/html/rfc9110#section-15.5.21>
+    // The JSON in the request is well-formed, but the template
+    // content has syntax errors
+    AppError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("{err:#}"))
+}
+
 async fn inject_v1_impl(
     auth: AuthInfo,
     sender: EnvelopeAddress,
@@ -949,7 +1024,9 @@ async fn inject_v1_impl(
     via_address: Option<IpAddr>,
     hostname: Option<String>,
 ) -> Result<Json<InjectV1Response>, AppError> {
-    request.normalize()?;
+    request.normalize().map_err(content_syntax_err)?;
+
+    let compiled = request.compile().map_err(content_syntax_err)?;
 
     if request.deferred_generation {
         return Ok(Json(
@@ -957,7 +1034,6 @@ async fn inject_v1_impl(
         ));
     }
 
-    let compiled = request.compile()?;
     let mut success_count = 0;
     let mut fail_count = 0;
     let mut errors = vec![];
@@ -1109,6 +1185,9 @@ pub fn activity_for_peer(
             "waiting for spool startup",
         ));
     }
+    if let Some(reason) = SpoolManager::get().spool_unhealthy_reason() {
+        return Err(AppError::new(StatusCode::SERVICE_UNAVAILABLE, reason));
+    }
 
     Ok(activity)
 }
@@ -1199,7 +1278,8 @@ pub fn activity_for_peer(
     path="/api/inject/v1",
     request_body=InjectV1Request,
     responses(
-        (status = 200, description = "Message(s) injected successfully", body=InjectV1Response)
+        (status = 200, description = "Message(s) injected successfully", body=InjectV1Response),
+        (status = 422, description = "One or more fields in the content section have syntax errors"),
     ),
 )]
 pub async fn inject_v1(
@@ -1238,7 +1318,7 @@ pub async fn inject_v1(
         &*HTTPINJECT
     };
 
-    let via_address = Some(app_state.local_addr().ip().clone());
+    let via_address = Some(app_state.local_addr().ip());
     let hostname = Some(app_state.params().hostname.to_string());
 
     pool.spawn(format!("http inject_v1 for {peer_address:?}"), async move {
@@ -1292,10 +1372,8 @@ impl HttpInjectionGeneratorDispatcher {
                     Ok(Some(v)) => v.parse().ok(),
                     _ => None,
                 };
-                let hostname: Option<String> = match msg.get_meta_string("hostname").await {
-                    Ok(v) => v,
-                    _ => None,
-                };
+                let hostname: Option<String> =
+                    msg.get_meta_string("hostname").await.unwrap_or_default();
 
                 let sender = msg.sender().await?;
 
@@ -1324,12 +1402,17 @@ impl QueueDispatcher for HttpInjectionGeneratorDispatcher {
             None => Ok(false),
         }
     }
-    async fn attempt_connection(&mut self, dispatcher: &mut Dispatcher) -> anyhow::Result<()> {
+    async fn attempt_connection(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+    ) -> anyhow::Result<AttemptConnectionDisposition> {
         if self.connection.is_none() {
             self.connection
                 .replace(dispatcher.metrics.wrap_connection(()));
+            Ok(AttemptConnectionDisposition::ConnectedNew)
+        } else {
+            Ok(AttemptConnectionDisposition::ReusedExisting)
         }
-        Ok(())
     }
     async fn have_more_connection_candidates(&mut self, _dispatcher: &mut Dispatcher) -> bool {
         false
@@ -1345,6 +1428,7 @@ impl QueueDispatcher for HttpInjectionGeneratorDispatcher {
             "smtp_dispatcher only supports a batch size of 1"
         );
         let msg = msgs.pop().expect("just verified that there is one");
+        dispatcher.set_detail("http_inject: try_send");
 
         let response = match self.try_send(msg).await {
             Ok(()) => Response {
@@ -1416,6 +1500,7 @@ This is a test message to {{ name }}, with some 👻🍉💩 emoji!
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Rfc822(input.to_string()),
@@ -1442,7 +1527,7 @@ Content-Transfer-Encoding: quoted-printable\r
 From: Me <me@example.com>\r
 Subject: =?UTF-8?q?A_test_=F0=9F=9B=B3=EF=B8=8F?=\r
 To: "James Smythe" <user@example.com>\r
-Mime-Version: 1.0\r
+MIME-Version: 1.0\r
 \r
 This is a test message to James Smythe, with some =F0=9F=91=BB=F0=9F=8D=89=\r
 =F0=9F=92=A9 emoji!\r
@@ -1465,6 +1550,7 @@ This is a test message to {{ name }}, with some 👻🍉💩 emoji!
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Rfc822(input.to_string()),
@@ -1491,7 +1577,7 @@ Content-Transfer-Encoding: quoted-printable\r
 From: Me <me@example.com>\r
 Subject: =?UTF-8?q?=D8=AA=D8=B3=D8=AA_=DB=8C=DA=A9_=D8=AF=D9=88_=D8=B3=D9=87?=\r
 To: "James Smythe" <user@example.com>\r
-Mime-Version: 1.0\r
+MIME-Version: 1.0\r
 \r
 This is a test message to James Smythe, with some =F0=9F=91=BB=F0=9F=8D=89=\r
 =F0=9F=92=A9 emoji!\r
@@ -1508,6 +1594,7 @@ This is a test message to James Smythe, with some =F0=9F=91=BB=F0=9F=8D=89=\r
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1585,6 +1672,66 @@ Some(
         k9::assert_equal!(structure.attachments.len(), 1);
     }
 
+    /// The HTTP inject API `recipients[].name` flows into
+    /// `builder.set_to(...)`. A stray CRLF in the name is rewritten to a space
+    /// during encoding, so it cannot split the header line and add a spurious
+    /// header to the generated message (no `Notes` header appears).
+    #[tokio::test]
+    async fn test_crlf_injection_via_recipient_name() {
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: Some("Ada Lovelace\r\nNotes: imported".to_string()),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("hi".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: None,
+                from: None,
+                reply_to: None,
+                headers: Default::default(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        println!("{generated}");
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        let names: Vec<String> = parsed
+            .headers()
+            .iter()
+            .map(|h| h.get_name().to_string())
+            .collect();
+        k9::snapshot!(
+            names,
+            r#"
+[
+    "Content-Type",
+    "To",
+    "MIME-Version",
+    "Date",
+]
+"#
+        );
+    }
+
     #[tokio::test]
     async fn test_to_from_builder() {
         let mut request = InjectV1Request {
@@ -1593,6 +1740,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1680,6 +1828,321 @@ Ok(
         );
     }
 
+    /// content.from and content.reply_to's display names undergo per-recipient
+    /// template substitution.
+    #[tokio::test]
+    async fn test_from_reply_to_are_templated() {
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: Some("James Smythe".to_string()),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("Hello".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: None,
+                from: Some(FromHeader {
+                    email: "from@example.com".to_string(),
+                    name: Some("Greetings {{ name }}".to_string()),
+                }),
+                reply_to: Some(FromHeader {
+                    email: "reply@example.com".to_string(),
+                    name: Some("{{ name }} Support".to_string()),
+                }),
+                headers: Default::default(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+
+        let from = parsed.headers().from().unwrap().expect("From present");
+        k9::assert_equal!(from[0].name.as_deref(), Some("Greetings James Smythe"));
+
+        let reply_to = parsed
+            .headers()
+            .reply_to()
+            .unwrap()
+            .expect("Reply-To present");
+        k9::assert_equal!(
+            reply_to
+                .extract_first_mailbox()
+                .expect("Reply-To mailbox")
+                .name
+                .as_deref(),
+            Some("James Smythe Support")
+        );
+    }
+
+    /// Verifies that a non-ASCII literal in an authored display name
+    /// substitutes correctly. The name is templated as raw text and encoded
+    /// only afterwards. Encoding first would turn the non-ASCII literal into an
+    /// RFC 2047 encoded-word, hiding the `{{ name }}` placeholder inside it so
+    /// the template engine could no longer find and substitute it.
+    #[tokio::test]
+    async fn test_from_non_ascii_literal_name_substitutes() {
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: Some("\u{592a}\u{90ce}".to_string()),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("Hello".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: None,
+                from: Some(FromHeader {
+                    email: "from@example.com".to_string(),
+                    name: Some("\u{5c71}\u{7530} {{ name }}".to_string()),
+                }),
+                reply_to: None,
+                headers: Default::default(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        k9::snapshot!(
+            parsed.headers().from(),
+            r#"
+Ok(
+    Some(
+        MailboxList(
+            [
+                Mailbox {
+                    name: Some(
+                        "山田 太郎",
+                    ),
+                    address: AddrSpec {
+                        local_part: "from",
+                        domain: "example.com",
+                    },
+                },
+            ],
+        ),
+    ),
+)
+"#
+        );
+    }
+
+    /// Verifies that a substituted recipient name containing address-list
+    /// punctuation (`"`, `<`, `>`, `,`) is encoded as the literal display name
+    /// text of one mailbox, rather than being able to terminate the quoting of
+    /// that mailbox and introduce a second one.
+    #[tokio::test]
+    async fn test_from_substituted_name_cannot_splice_address() {
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: Some("Ada Lovelace <ada@example.com>, Bob".to_string()),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("Hello".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: None,
+                from: Some(FromHeader {
+                    email: "from@example.com".to_string(),
+                    name: Some("{{ name }}".to_string()),
+                }),
+                reply_to: None,
+                headers: Default::default(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        // One mailbox whose display name holds the punctuation verbatim. No
+        // second mailbox was spliced in.
+        k9::snapshot!(
+            parsed.headers().from(),
+            r#"
+Ok(
+    Some(
+        MailboxList(
+            [
+                Mailbox {
+                    name: Some(
+                        "Ada Lovelace <ada@example.com>, Bob",
+                    ),
+                    address: AddrSpec {
+                        local_part: "from",
+                        domain: "example.com",
+                    },
+                },
+            ],
+        ),
+    ),
+)
+"#
+        );
+    }
+
+    /// Generate the message for a recipient named `recip_name` with `header`
+    /// set to `value` in content.headers.
+    fn generate_with_header(
+        recip_name: Option<&str>,
+        header: &str,
+        value: &str,
+    ) -> anyhow::Result<String> {
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: recip_name.map(str::to_string),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("Hello".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: None,
+                from: None,
+                reply_to: None,
+                headers: [(header.to_string(), value.to_string())]
+                    .into_iter()
+                    .collect(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+        request.normalize()?;
+        let compiled = request.compile()?;
+        compiled.expand_for_recip(
+            &request.recipients[0],
+            &request.substitutions,
+            &request.content,
+        )
+    }
+
+    /// Verifies that a user-supplied address header in the generic headers map
+    /// is emitted through the address grammar: a non-ASCII display name is an
+    /// encoded-word around only the name, and the header re-parses as an
+    /// address list.
+    #[tokio::test]
+    async fn test_user_address_header_is_parseable() {
+        let generated = generate_with_header(
+            Some("\u{5c71}\u{7530}"),
+            "Cc",
+            "\"{{ name }}\" <cc@example.com>",
+        )
+        .unwrap();
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        k9::snapshot!(
+            parsed.headers().cc(),
+            r#"
+Ok(
+    Some(
+        AddressList(
+            [
+                Mailbox(
+                    Mailbox {
+                        name: Some(
+                            "山田",
+                        ),
+                        address: AddrSpec {
+                            local_part: "cc",
+                            domain: "example.com",
+                        },
+                    },
+                ),
+            ],
+        ),
+    ),
+)
+"#
+        );
+    }
+
+    /// Verifies that a user-supplied address header whose rendered value is not
+    /// a valid address fails with a per-recipient error naming the header,
+    /// rather than being emitted as corrupt free text.
+    #[tokio::test]
+    async fn test_user_address_header_malformed_errors() {
+        let err = generate_with_header(None, "Cc", "this is not an address").unwrap_err();
+        k9::assert_equal!(
+            err.to_string(),
+            "parsing Cc header value \"this is not an address\""
+        );
+    }
+
+    /// Verifies that a user-supplied address header whose rendered value is
+    /// blank (e.g. a conditionally-empty substitution) does not fail
+    /// expand_for_recip.
+    #[tokio::test]
+    async fn test_user_address_header_empty_value_is_not_an_error() {
+        let generated = generate_with_header(None, "Cc", "").unwrap();
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        let raw = parsed
+            .headers()
+            .get_first("Cc")
+            .expect("Cc header present")
+            .get_raw_value()
+            .to_string();
+        k9::assert_equal!(raw.trim(), "");
+    }
+
     #[tokio::test]
     async fn test_builder_static_dialect() {
         let mut request = InjectV1Request {
@@ -1688,6 +2151,7 @@ Ok(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1787,6 +2251,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1849,6 +2314,194 @@ Some(
     }
 
     #[tokio::test]
+    async fn test_builder_default_to_header_per_recipient() {
+        // Tests that when no To header is provided in content.headers,
+        // a per-recipient To is generated from email+name.
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: Some("James Smythe".to_string()),
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("I am the plain text, {{ name }}. 😀".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: Some("hello {{ name }}".to_string()),
+                from: Some(FromHeader {
+                    email: "from@example.com".to_string(),
+                    name: Some("Sender Name".to_string()),
+                }),
+                reply_to: None,
+                headers: BTreeMap::new(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: TemplateDialectWithSchema::Handlebars,
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+
+        // Recipient: gets default To from their own email+name
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        let structure = parsed.simplified_structure().unwrap();
+
+        k9::snapshot!(
+            structure.headers.to().unwrap(),
+            r#"
+Some(
+    AddressList(
+        [
+            Mailbox(
+                Mailbox {
+                    name: Some(
+                        "James Smythe",
+                    ),
+                    address: AddrSpec {
+                        local_part: "user",
+                        domain: "example.com",
+                    },
+                },
+            ),
+        ],
+    ),
+)
+"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_to_header_substitution_override() {
+        // Tests explicit `To: {{ to_header }}` in content.headers where:
+        // - Recipient 0: no override, gets the pre-defined default
+        // - Recipient 1: overrides `to_header` via substitutions
+        let mut request = InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![
+                Recipient {
+                    email: "user@example.com".to_string(),
+                    name: Some("James Smythe".to_string()),
+                    substitutions: HashMap::new(),
+                    metadata: HashMap::new(),
+                },
+                Recipient {
+                    email: "second@example.com".to_string(),
+                    name: Some("Second User".to_string()),
+                    substitutions: [(
+                        "to_header".to_string(),
+                        Value::String("custom.to@example.com".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    metadata: HashMap::new(),
+                },
+            ],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("I am the plain text, {{ name }}. 😀".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                subject: Some("hello {{ name }}".to_string()),
+                from: Some(FromHeader {
+                    email: "from@example.com".to_string(),
+                    name: Some("Sender Name".to_string()),
+                }),
+                reply_to: None,
+                headers: [("To".to_string(), "{{ to_header }}".to_string())]
+                    .into_iter()
+                    .collect(),
+                attachments: vec![],
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: TemplateDialectWithSchema::Handlebars,
+        };
+
+        request.normalize().unwrap();
+        let compiled = request.compile().unwrap();
+
+        // Recipient 0: no override, to_header renders to pre-defined default
+        let generated0 = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        let parsed0 = MimePart::parse(generated0.as_str()).unwrap();
+        let structure0 = parsed0.simplified_structure().unwrap();
+
+        k9::snapshot!(
+            structure0.headers.to().unwrap(),
+            r#"
+Some(
+    AddressList(
+        [
+            Mailbox(
+                Mailbox {
+                    name: Some(
+                        "James Smythe",
+                    ),
+                    address: AddrSpec {
+                        local_part: "user",
+                        domain: "example.com",
+                    },
+                },
+            ),
+        ],
+    ),
+)
+"#
+        );
+
+        // Recipient 1: overrides to_header with custom value
+        let generated1 = compiled
+            .expand_for_recip(
+                &request.recipients[1],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        let parsed1 = MimePart::parse(generated1.as_str()).unwrap();
+        let structure1 = parsed1.simplified_structure().unwrap();
+
+        k9::snapshot!(
+            structure1.headers.to().unwrap(),
+            r#"
+Some(
+    AddressList(
+        [
+            Mailbox(
+                Mailbox {
+                    name: None,
+                    address: AddrSpec {
+                        local_part: "custom.to",
+                        domain: "example.com",
+                    },
+                },
+            ),
+        ],
+    ),
+)
+"#
+        );
+    }
+
+    #[tokio::test]
     async fn test_builder_handlebars_dialect() {
         let mut request = InjectV1Request {
             envelope_sender: "noreply@example.com".to_string(),
@@ -1856,6 +2509,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1933,6 +2587,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {

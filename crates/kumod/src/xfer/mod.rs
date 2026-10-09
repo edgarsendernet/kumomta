@@ -1,7 +1,7 @@
 use crate::http_server::inject_v1::activity_for_peer;
 use crate::logging::disposition::{log_disposition, LogDisposition};
 use crate::queue::{DeliveryProto, QueueConfig, QueueManager};
-use crate::ready_queue::{Dispatcher, QueueDispatcher};
+use crate::ready_queue::{AttemptConnectionDisposition, Dispatcher, QueueDispatcher};
 use crate::spool::SpoolManager;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -149,8 +149,11 @@ impl QueueDispatcher for XferDispatcher {
         Ok(true)
     }
 
-    async fn attempt_connection(&mut self, _dispatcher: &mut Dispatcher) -> anyhow::Result<()> {
-        Ok(())
+    async fn attempt_connection(
+        &mut self,
+        _dispatcher: &mut Dispatcher,
+    ) -> anyhow::Result<AttemptConnectionDisposition> {
+        Ok(AttemptConnectionDisposition::ReusedExisting)
     }
 
     async fn have_more_connection_candidates(&mut self, _dispatcher: &mut Dispatcher) -> bool {
@@ -187,6 +190,7 @@ impl QueueDispatcher for XferDispatcher {
         let mut url = self.proto.target.clone();
         url.set_path("/api/xfer/inject/v1");
         let path_config = dispatcher.path_config.borrow();
+        dispatcher.set_detail(format!("xfer POST {url}"));
 
         let response = reqwest::Client::builder()
             .timeout(path_config.client_timeouts.data_dot_timeout)
@@ -329,6 +333,7 @@ pub async fn inject_xfer_v1(
         peer_address: Some(&ResolvedAddress {
             name: "".to_string(),
             addr: peer_address.into(),
+            is_secure: false,
         }),
         response: Response {
             code: 250,

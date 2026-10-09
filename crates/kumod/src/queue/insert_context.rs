@@ -79,6 +79,17 @@ pub enum InsertReason {
     /// The safey net in Dispatcher::Drop re-queued the message.
     /// This shouldn't happen; if you see this in a log, please report it!
     DispatcherDrop,
+    /// The peer unilaterally closed the connection before we started
+    /// delivery, so we want to try a new connection plan
+    PeerClosedConnection,
+    /// The delivery protocol associated with the queue implicitly via the
+    /// scheduled queue configuration changed
+    ProtocolChanged,
+    /// The spool subsystem is unhealthy and delivery cannot safely proceed
+    SpoolUnhealthy,
+    /// The egress source is unhealthy and has been auto-suspended via
+    /// one of its `suspend_when_*` rules
+    SourceIsUnhealthyAndSuspended,
 }
 
 #[cfg(test)]

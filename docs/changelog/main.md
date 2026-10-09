@@ -1,88 +1,153 @@
 # Unreleased Changes in The Mainline
 
 ## Breaking Changes
- * The `rfc5321_rustls_config` cache has been renamed to `rustls_client_config`.
-   If you have a policy that tunes this cache via
-   [kumo.set_lruttl_cache_capacity](../reference/kumo/set_lruttl_cache_capacity.md),
-   you will need to update the cache name.
- * The effect of the [skip_hosts](../reference/kumo/make_egress_path/skip_hosts.md)
-   configuration has been downgraded from a `550` to a `451` to make it more inline
-   with the effect of resolving a domain to an empty list of MX hosts.  The rationale
-   for this is that users primarily employ `skip_hosts` to prevent the use of IPv6.
-   That, coupled with a few recent issues with Microsoft hosted domains where their
-   DNS would only transiently return IPv6 addresses (no IPv4) addresses meant that
-   some mail could be inadvertently permanently failed.  The reason field now
-   also has `KumoMTA internal:` prefixed to it, to make it clearer that it was
-   synthesized by us, rather than returned from a remote host.
+
+* The `LocalDisk` spool kind is deprecated and slated for removal in a future
+  release. It has not yet been removed, but defining a spool with it now logs
+  an error to advise you of the future removal. Use the `RocksDB` kind instead;
+  it is faster, more durable, uses less space (and thus IOPS), and is the
+  recommended production configuration.  In addition, we've made the
+  [kind](../reference/kumo/define_spool/kind.md) field of
+  [kumo.define_spool](../reference/kumo/define_spool/index.md) a required field
+  so that new users don't accidentally deploy with `LocalDisk` between now and
+  the removal of the `LocalDisk` support.
+
+* [kumo.dns.configure_unbound_resolver](../reference/kumo.dns/configure_unbound_resolver.md)
+  is deprecated and slated for removal in a future release. It is not yet
+  removed, but calling it now logs an error to advise you of the future removal.
+  Use [kumo.dns.configure_resolver](../reference/kumo.dns/configure_resolver.md)
+  instead.  The only reason to consider using the `configure_unbound_resolver`
+  was if you required DANE support, but the hickory resolver has been able to
+  satisfy that requirement since version `2026.09.22-a276d4a8` and works more
+  reliably in KumoMTA.
+
+* Site-name generation now preserves complete hostname branches instead of
+  combining labels independently. Distinct MX sets that previously collided
+  now have separate site names and ready queues. For example, two real-world
+  Zoho MX sets:
+
+  ```text
+  Set A: mx.zoho.com, mx2.zoho.com, mx3.zoho.eu
+  Set B: mx.zoho.com, mx2.zoho.eu,  mx3.zoho.com
+
+  Before (both): (mx|mx2|mx3).zoho.(com|eu)
+  After A:       ((mx|mx2).zoho.com|mx3.zoho.eu)
+  After B:       ((mx|mx3).zoho.com|mx2.zoho.eu)
+  ```
+
+  This affects the site names that you may observe in metrics and kcli command
+  output.  It is recommended that you review whether you have hardcoded any
+  assumptions about the site name in your monitoring/orchestration integration
+  prior to upgrading.  We do not anticipate this affecting anyone in practice.
+  See [Site Names](../reference/queues.md#site-names) for details.
 
 ## Other Changes and Enhancements
- * Enhanced [Access Control](../reference/access_control.md) subsystem,
-   supported by a new Authentication, Authorization and Accounting (AAA) module
-   exposed to lua as [kumo.aaa](../reference/kumo.aaa/index.md).
- * The `Handlebars` template dialect now runs with recursive lookup
-   for improved compatibility with other handlebars implementations.
- * `msg:check_fix_conformance()` can now detect and attempt to fix issues where
-   the charset is invalid for parts that use transfer-encoding, by applying
-   any charset detection options, falling back to UTF-8.
- * The lua HTTP `Request` object now supports AWS V4 signatures via a new
-   [request:aws_sign_v4](../reference/kumo.http/Request.md#requestaws_sign_v4params)
-   method.  Thanks to @AdityaAudi! #458
- * The [HTTP Injection API](../reference/http/kumod/api_inject_v1_post.md) and [MIME
-   Builder API](../reference/kumo.mimepart/builder.md) now support creating
-   messages with [AMP
-   HTML](https://amp.dev/documentation/guides-and-tutorials/email/learn/email-spec/amp-email-structure)
-   parts.
-   [mimepart:get_simple_structure()](../reference/mimepart/get_simple_structure.md)
-   also supports AMP HTML parts.
- * Improved the context shown in error messages produced by the HTTP injection
-   API
- * Kumo Proxy:
-     * Now optionally supports configuration via a proxy policy lua script.
-     * Optional support for TLS and mutual TLS when using a proxy policy script,
-       however, kumod itself doesn't currently support using TLS for SOCKS5.
-     * Optional support for RFC 1929 authentication
-     * Use [proxy.start_proxy_listener](../reference/proxy/start_proxy_listener/index.md)
-       function to configure a SOCKS5 proxy server
-     * Many thanks to @vietcgi! #459
-     * Exposes [proxy-specific metrics](../reference/metrics/proxy-server/index.md)
-       via its new [proxy.start_http_listener](../reference/proxy/start_http_listener.md).
-       Thanks to @AdityaAudi! #472
- * New [kumo.xfer.xfer](../reference/kumo.xfer/xfer.md) and
-   [kumo.xfer.xfer_in_requeue](../reference/kumo.xfer/xfer_in_requeue.md)
-   functions to enable per-message transfer between nodes, which is useful in
-   combination with the
-   [requeue_message](../reference/events/requeue_message.md) event.
- * New
-   [message:increment_num_attempts](../reference/message/increment_num_attempts.md)
-   method for advanced message manipulation.
- * The [requeue_message](../reference/events/requeue_message.md) event now
-   exposes additional context about the event leading to the the requeue,
-   allowing for more nuanced/advanced requeue logic.
- * Each metric exported by kumod now has a documentation page. You can find an
-   index at [kumod metrics](../reference/metrics/kumod/index.md).
+
+ * The SOCKS5 proxy listener now accepts a
+   [max_connections](../reference/proxy/start_proxy_listener/max_connections.md)
+   parameter (default `32768`) that bounds the number of concurrent client
+   connections. Connections above the limit are closed immediately and counted
+   by the new
+   [proxy_connections_denied_total](../reference/metrics/proxy-server/proxy_connections_denied_total.md)
+   metric.
+
+ * You may now monitor the status of your log consumers via kumod metrics. For
+   [configure_local_logs](../reference/kumo/configure_local_logs/index.md) and
+   [kumo.jsonl.new_writer](../reference/kumo.jsonl/new_writer.md), the status of
+   jsonl log segments is reported based on the checkpoint files maintained in
+   the corresponding log directories. The new
+   [log_consumer_segments_behind](../reference/metrics/kumod/log_consumer_segments_behind.md),
+   [log_consumer_bytes_behind](../reference/metrics/kumod/log_consumer_bytes_behind.md),
+   and
+   [log_consumer_lag_seconds](../reference/metrics/kumod/log_consumer_lag_seconds.md)
+   metrics expose this information.
+
+ * The systemd unit now launches kumod directly as the `kumod` user, with
+   `CAP_NET_BIND_SERVICE` granted ambiently, matching the configuration that
+   kumod would establish for itself when spawned as root, but doing so without
+   ever having full root privilege.  If you deploy your own unit file, add
+   `User=kumod`, `Group=kumod`, `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
+   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to adopt the same model.
+
+ * The `log_hooks` helper
+   [new_disposition_hook](../reference/kumo/configure_log_disposition_hook.md#using-the-log_hooks-helper)
+   now accepts a `log_parameters` table and forwards it to
+   [kumo.configure_log_disposition_hook](../reference/kumo/configure_log_disposition_hook.md),
+   letting you set options such as `per_record` through the helper. #499 #500 #519 #520
+
+ * [kumo.memoize](../reference/kumo/memoize.md) caches now run the population
+   function that fills a cache miss on a separate task by default, rather than
+   on the calling task. A caller that is cancelled (an HTTP request handler
+   whose client disconnected) no longer cancels the cache population function.
+   The new `detached` memoize option can be used to override this if needed.  #602
 
 ## Fixes
 
- * An SPF record containing U+200B (zero width space) could cause
-   SPF record parsing to panic and the service to crash
- * MIME part body extraction did not always consider the charset for text parts
- * Errors raised while dispatching
-   [should_enqueue_log_record](../reference/events/should_enqueue_log_record.md)
-   were not logged to the diagnostic log.
- * Rebuilding (eg: for conformance fixing via `msg:check_fix_conformance()`, or
-   as part of the post-HTTP injection fixup) a header like `From:
-   "something\n\tthat wraps lines" <user@example.com>` would produce an invalid
-   rendition of that header.
- * Setting `content.headers["To"]` in the HTTP injection API would result in
-   two `To` headers being generated in the message; one for the per-recipient
-   `To` header, and one for the specified `content.headers["To"]` value.  This
-   has been fixed; the behavior now is to use the `content.headers["To"]`
-   header and not to emit a per-recipient `To` header in this situation.
- * HTTP Injection didn't gate on the spool being started which meant that
-   there was a race condition on startup where an injection request could
-   begin processing prior to starting spool enumeration, which could then
-   cause a `set_meta_spool has not been called` panic.
- * HTTP Injection and XFER Injections didn't grab an Activity handle which
-   meant that there was a potential race condition when shutting down the
-   system which could result in loss of accountability of the message(s)
-   that were part of that request.
+ * DKIM relaxed body canonicalization now reduces an empty body, or a body
+   consisting only of empty or whitespace-only lines, to zero octets as required
+   by RFC 6376 section 3.4.4. Previously it retained a CRLF, producing a body
+   hash that disagreed with verifiers such as Gmail and causing otherwise-valid
+   signatures to fail. Thanks to @bjarn! #575
+
+ * SMTP and SOCKS5 proxy listeners no longer stop serving when `accept` returns
+   an error. Previously a transient error such as file-descriptor exhaustion
+   (`EMFILE`/`ENFILE`) propagated out of the accept loop and permanently halted
+   the listener while the process kept running. Because the process itself
+   stayed up, a supervisor such as systemd's `Restart=always` saw a healthy
+   process and would not restart it, leaving only a manual service restart to
+   recover the listener. The listeners now log and continue, pausing briefly on
+   resource-exhaustion errors to avoid spinning.
+
+ * When started as root with `--user`, kumod now sets the real, effective and
+   saved user and group ids to the target user, rather than lowering only the
+   effective user id. Previously the real and saved ids remained `0`, which
+   could potentially allow code running inside kumod to call `setresuid(0,0,0)`
+   and regain full root privilege.  No such code exists in kumod itself, but
+   it presented a potential avenue for an attacker, if they could contrive
+   for kumod to execute arbitrary code through some other vulerability.
+   No remote code execution vulnerabilities are known to exist.
+   kumod now retains only `CAP_NET_BIND_SERVICE`, which it needs to bind
+   privileged ports.
+
+ * [kumo.generate_rfc3464_message](../reference/kumo/generate_rfc3464_message.md)
+   no longer fails to produce a bounce when the original message has 8-bit
+   headers or body. The returned copy of the original is encoded to keep the
+   report 7-bit clean, and downgrades to just the headers, or is omitted, when
+   its content cannot be represented that way.
+
+ * The [mail_auth](../reference/policy-extras.mail_auth/index.md) iprev check now
+   follows at most 10 of the connecting IP's PTR names with forward A/AAAA
+   lookups, as required by RFC 8601 section 3. Previously it followed every
+   name, letting the owner of the reverse zone drive an unbounded number of DNS
+   lookups per connection. #623
+
+ * The SMTP connection plan built for a delivery attempt is now bounded by two
+   new [make_egress_path](../reference/kumo/make_egress_path/index.md) options,
+   [max_mx_addresses_per_host](../reference/kumo/make_egress_path/max_mx_addresses_per_host.md)
+   (default `10`) and
+   [max_mx_plan_size](../reference/kumo/make_egress_path/max_mx_plan_size.md)
+   (default `50`). Previously MX resolution retained every address of every MX
+   host with no cap, which meant that the connection plan could be arbitrarily
+   large. #622
+
+ * Fixed a DANE downgrade that could occur when an A or AAAA lookup returned a
+   bogus (DNSSEC validation failure) result. Such a result now defers delivery
+   rather than being treated as ordinary unsigned addresses. #612
+
+ * Fixed the handling of a failed MX lookup on the deprecated unbound resolver
+   backend.  A DNS *failure* response (SERVFAIL, REFUSED, or any other
+   non-NXDOMAIN failure RCODE) is now classified as a temporary error instead,
+   and it no longer qualifies for the implicit `MX->A` fallback and is treated
+   as an ordinary failed lookup, as RFC 5321 section 5.1 requires.  The default
+   hickory backend already reports these failures as errors and its behavior is
+   unchanged. #629
+
+ * A DNSSEC-bogus MX answer (one that failed DNSSEC validation) is no longer
+   used to route mail. The MX lookup now treats a bogus result as a temporary
+   error and defers, rather than using forged or tampered MX hosts as an
+   ordinary unsigned MX set, as RFC 7672 section 2.1.1 requires. This is the MX
+   counterpart of the A/AAAA bogus fix above (#612). It applies both to the
+   deprecated unbound backend and to a hickory backend that has been
+   explicitly configured to perform DNSSEC validation (`validate = true`)
+   against an upstream that does not validate (a validating upstream returns a
+   SERVFAIL for bogus data, which hickory handles as an error). #629
